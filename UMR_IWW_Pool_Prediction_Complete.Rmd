@@ -1,0 +1,988 @@
+---
+title: "Pool-Based Dredging Prediction for Upper Mississippi & Illinois Waterway"
+subtitle: "USACE Rock Island District - Predictive Dredging Operations"
+author: "Capstone Project"
+output: html_document
+date: "2025"
+---
+
+## Project Context
+
+This script implements a pool-based machine learning framework to predict dredging 
+need in the Upper Mississippi River and Illinois Waterway system. The approach:
+
+1. Uses **XGBoost feature selection** to identify the most predictive gages for each pool
+2. Trains **regression models** to predict shoaling rates (ft/yr)
+3. Trains **binary classifiers** to predict dredge need (Yes/No)
+4. Generates **mapping products** for dredge coordinators
+
+---
+
+## Setup and Data Loading
+
+```{r setup, message=FALSE, warning=FALSE}
+# Core packages
+library(tidyverse)
+library(lubridate)
+library(zoo)
+
+# Machine learning
+library(caret)
+library(xgboost)
+
+# Visualization
+library(ggplot2)
+library(patchwork)
+library(viridis)
+library(knitr)
+library(kableExtra)
+
+# Parallel processing
+library(doParallel)
+cl <- makeCluster(detectCores() - 1)
+registerDoParallel(cl)
+
+# Create output directories
+dir.create("./outputs", showWarnings = FALSE)
+dir.create("./outputs/feature_selection", showWarnings = FALSE)
+dir.create("./outputs/models", showWarnings = FALSE)
+dir.create("./outputs/maps", showWarnings = FALSE)
+
+cat("Setup complete\n")
+```
+
+```{r load_data}
+# Load datasets
+gage_data <- read_csv("UMR_IWW_1999_2024.csv", show_col_types = FALSE)
+CSAT_data <- read_csv("CSAT_DATA_Combined.csv", show_col_types = FALSE)
+gage_metadata <- read_csv("gage_metadata.csv", show_col_types = FALSE)
+
+cat("=== DATA LOADED ===\n")
+cat("Gage observations:", nrow(gage_data), "\n")
+cat("CSAT survey pairs:", nrow(CSAT_data), "\n")
+cat("Gages in metadata:", nrow(gage_metadata), "\n")
+```
+
+---
+
+## Step 1: Data Cleaning (From Your Existing Code)
+
+```{r clean_gage_data}
+# Clean gage data - convert dates and add temporal features
+gage_data_cleaned <- gage_data %>%
+  mutate(
+    Date = dmy(Date),
+    Year = year(Date),
+    Month = month(Date),
+    Day = yday(Date),
+    WeekOfYear = week(Date),
+    Season = case_when(
+      Month %in% c(12, 1, 2) ~ "Winter",
+      Month %in% c(3, 4, 5) ~ "Spring",
+      Month %in% c(6, 7, 8) ~ "Summer",
+      Month %in% c(9, 10, 11) ~ "Fall"
+    ),
+    Season = factor(Season, levels = c("Winter", "Spring", "Summer", "Fall"))
+  ) %>%
+  filter(!is.na(Date)) %>%
+  arrange(Date)
+
+# Interpolate missing values (max 4-day gaps)
+gage_cols <- setdiff(names(gage_data_cleaned), 
+                     c("Date", "Year", "Month", "Day", "WeekOfYear", "Season"))
+
+gage_data_interpolated <- gage_data_cleaned %>%
+  mutate(across(all_of(gage_cols), ~ na.approx(.x, x = Date, maxgap = 4, na.rm = FALSE)))
+
+cat("Gage data cleaned and interpolated\n")
+cat("Missing values before:", sum(is.na(gage_data_cleaned[, gage_cols])), "\n")
+cat("Missing values after:", sum(is.na(gage_data_interpolated[, gage_cols])), "\n")
+```
+
+```{r clean_csat_data}
+# Clean CSAT data
+CSAT_data_cleaned <- CSAT_data %>%
+  mutate(
+    SurveyDateBefore = ymd(as.character(SurveyDateBefore)),
+    SurveyDateAfter = ymd(as.character(SurveyDateAfter)),
+    DaysBetween = as.numeric(SurveyDateAfter - SurveyDateBefore)
+  ) %>%
+  filter(
+    !is.na(AnnualShoalingRate_ftperyr),
+    !is.infinite(AnnualShoalingRate_ftperyr),
+    abs(AnnualShoalingRate_ftperyr) <= 30,
+    DaysBetween <= 365,
+    !pool %in% c("AL", "LP", "BR", "CS", "24")  # Exclude pools with insufficient data
+  )
+
+cat("CSAT data cleaned:", nrow(CSAT_data_cleaned), "observations\n")
+```
+
+---
+
+## Step 2: Create Pool-Level Target Variable
+
+Aggregate reach-level shoaling rates to pool level for operational decision-making.
+
+```{r create_pool_targets}
+create_pool_targets <- function(csat_data) {
+  
+  pool_data <- csat_data %>%
+    # Aggregate to pool level (weighted by survey area)
+    group_by(pool, river, SurveyDateAfter) %>%
+    summarise(
+      # Primary target: weighted mean shoaling rate
+      Pool_ShoalingRate_ftyr = weighted.mean(
+        AnnualShoalingRate_ftperyr,
+        w = SurveyOverlapArea_sqft,
+        na.rm = TRUE
+      ),
+      # Secondary: total volume change
+      Pool_VolumeChange_CY = sum(NetVolumeChange_CY, na.rm = TRUE),
+      # Data quality indicators
+      N_Reaches_Surveyed = n(),
+      Total_Survey_Area = sum(SurveyOverlapArea_sqft, na.rm = TRUE),
+      Avg_DaysBetween = mean(DaysBetween, na.rm = TRUE),
+      .groups = "drop"
+    ) %>%
+    # Add temporal features
+    mutate(
+      Year = year(SurveyDateAfter),
+      Month = month(SurveyDateAfter),
+      WeekOfYear = week(SurveyDateAfter),
+      Season = case_when(
+        Month %in% c(12, 1, 2) ~ "Winter",
+        Month %in% c(3, 4, 5) ~ "Spring",
+        Month %in% c(6, 7, 8) ~ "Summer",
+        Month %in% c(9, 10, 11) ~ "Fall"
+      ),
+      Season = factor(Season, levels = c("Winter", "Spring", "Summer", "Fall"))
+    ) %>%
+    # Create binary classification target
+    # Positive shoaling = sediment accumulation = dredge need
+    mutate(
+      Dredge_Need = as.factor(ifelse(Pool_ShoalingRate_ftyr > 0, "Yes", "No"))
+    )
+  
+  return(pool_data)
+}
+
+pool_targets <- create_pool_targets(CSAT_data_cleaned)
+
+# Summary statistics by pool
+pool_summary <- pool_targets %>%
+  group_by(pool, river) %>%
+  summarise(
+    N_Observations = n(),
+    Date_Range = paste(min(SurveyDateAfter), "to", max(SurveyDateAfter)),
+    Mean_ShoalingRate = round(mean(Pool_ShoalingRate_ftyr, na.rm = TRUE), 3),
+    SD_ShoalingRate = round(sd(Pool_ShoalingRate_ftyr, na.rm = TRUE), 3),
+    Pct_Dredge_Need = round(mean(Dredge_Need == "Yes") * 100, 1),
+    .groups = "drop"
+  ) %>%
+  arrange(river, pool)
+
+cat("\n=== POOL-LEVEL TARGET SUMMARY ===\n")
+print(pool_summary)
+
+# Identify pools with sufficient data for modeling (minimum 40 observations)
+sufficient_pools <- pool_summary %>%
+  filter(N_Observations >= 40) %>%
+  pull(pool)
+
+cat("\nPools with sufficient data (>=40 obs):", paste(sufficient_pools, collapse = ", "), "\n")
+```
+
+---
+
+## Step 3: Join Pool Targets with Gage Data
+
+```{r join_data}
+# Join pool-level targets with gage observations
+pool_model_data <- pool_targets %>%
+  left_join(
+    gage_data_interpolated,
+    by = c("SurveyDateAfter" = "Date")
+  )
+
+cat("Joined dataset:", nrow(pool_model_data), "observations\n")
+cat("Pools represented:", length(unique(pool_model_data$pool)), "\n")
+```
+
+---
+## Step 4: Gage-to-Pool Mapping Functions
+
+Define functions to identify candidate gages for each pool based on your metadata.
+
+```{r gage_mapping_functions}
+# Get gages directly assigned to a pool in metadata
+get_pool_gages <- function(pool_name, metadata) {
+  metadata %>%
+    filter(Pool == pool_name) %>%
+    pull(Gage_ID)
+}
+
+# Get upstream gages that may influence a pool
+get_upstream_gages <- function(pool_name, metadata, n_upstream = 5) {
+  
+  pool_info <- metadata %>% filter(Pool == pool_name)
+  
+  if(nrow(pool_info) == 0) return(character(0))
+  
+  river_type <- unique(pool_info$River)[1]
+  target_mile <- max(pool_info$RiverMile, na.rm = TRUE)
+  
+  # Upstream = higher river mile
+  upstream <- metadata %>%
+    filter(River == river_type, RiverMile > target_mile) %>%
+    arrange(RiverMile) %>%
+    head(n_upstream) %>%
+    pull(Gage_ID)
+  
+  return(upstream)
+}
+
+# Get ALL candidate gages for a pool (pool + upstream + tributaries)
+get_candidate_gages <- function(pool_name, metadata, include_upstream = TRUE, 
+                                 n_upstream = 5) {
+  
+  # Gages within the pool
+  pool_gages <- get_pool_gages(pool_name, metadata)
+  
+  # Add upstream gages
+  if(include_upstream) {
+    upstream_gages <- get_upstream_gages(pool_name, metadata, n_upstream)
+    pool_gages <- unique(c(pool_gages, upstream_gages))
+  }
+  
+  return(pool_gages)
+}
+
+# Display gage assignments
+cat("\n=== GAGE-TO-POOL MAPPING ===\n")
+for(p in sufficient_pools) {
+  candidates <- get_candidate_gages(p, gage_metadata, include_upstream = TRUE, n_upstream = 5)
+  cat(sprintf("Pool %s: %d candidate gages\n", p, length(candidates)))
+}
+```
+
+---
+
+## Step 5: XGBoost Feature Selection
+
+**This is the key step** - identifies which gages are most predictive for each pool.
+
+```{r xgboost_feature_selection}
+# ============================================================
+# XGBOOST FEATURE SELECTION FUNCTION
+# Uses Gain metric to rank gage importance for each pool
+# ============================================================
+
+select_top_gages_xgb <- function(data, pool_name, candidate_gages, 
+                                  n_top = 6, verbose = TRUE) {
+  
+  if(verbose) cat(sprintf("\n=== Feature Selection: Pool %s ===\n", pool_name))
+  
+  # Get available candidate gages (must exist in data)
+  available_gages <- intersect(candidate_gages, names(data))
+  
+  if(length(available_gages) == 0) {
+    if(verbose) cat("  No candidate gages found in data\n")
+    return(NULL)
+  }
+  
+  # Filter to this pool and select features
+  pool_data <- data %>%
+    filter(pool == pool_name) %>%
+    select(Pool_ShoalingRate_ftyr, WeekOfYear, all_of(available_gages)) %>%
+    drop_na()
+  
+  if(nrow(pool_data) < 50) {
+    if(verbose) cat(sprintf("  Insufficient data (n=%d, need 50+)\n", nrow(pool_data)))
+    return(NULL)
+  }
+  
+  if(verbose) {
+    cat(sprintf("  Observations: %d\n", nrow(pool_data)))
+    cat(sprintf("  Candidate gages: %d\n", length(available_gages)))
+  }
+  
+  # Prepare matrices for XGBoost
+  X <- as.matrix(pool_data %>% select(-Pool_ShoalingRate_ftyr))
+  y <- pool_data$Pool_ShoalingRate_ftyr
+  
+  dtrain <- xgb.DMatrix(data = X, label = y)
+  
+  # Train XGBoost model for feature importance
+  set.seed(118)
+  xgb_model <- xgb.train(
+    params = list(
+      objective = "reg:squarederror",
+      max_depth = 6,
+      eta = 0.1,
+      colsample_bytree = 0.8,
+      subsample = 0.8
+    ),
+    data = dtrain,
+    nrounds = 100,
+    verbose = 0
+  )
+  
+  # Extract feature importance (Gain is most meaningful)
+  importance <- xgb.importance(model = xgb_model)
+  
+  if(verbose) {
+    cat("\n  Feature Importance (by Gain):\n")
+    print(importance %>% select(Feature, Gain, Cover, Frequency) %>% head(10))
+  }
+  
+  # Select top N features
+  top_features <- importance$Feature[1:min(n_top, nrow(importance))]
+  
+  # Separate WeekOfYear (always included) from gage features
+  top_gages <- setdiff(top_features, "WeekOfYear")
+  
+  if(verbose) {
+    cat(sprintf("\n  SELECTED TOP %d GAGES: %s\n", 
+                length(top_gages), paste(top_gages, collapse = ", ")))
+  }
+  
+  return(list(
+    pool = pool_name,
+    importance = importance,
+    top_gages = top_gages,
+    all_candidates = available_gages,
+    n_observations = nrow(pool_data)
+  ))
+}
+
+# ============================================================
+# RUN FEATURE SELECTION FOR ALL POOLS
+# ============================================================
+
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║           XGBOOST FEATURE SELECTION BY POOL                      ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n")
+
+# Get all available gages in the dataset
+all_available_gages <- intersect(gage_metadata$Gage_ID, names(pool_model_data))
+cat("Total gages available in data:", length(all_available_gages), "\n")
+
+# Run feature selection for each pool
+pool_feature_selection <- list()
+
+for(p in sufficient_pools) {
+  
+  # Get candidate gages for this pool (pool + upstream)
+  candidate_gages <- get_candidate_gages(p, gage_metadata, 
+                                          include_upstream = TRUE, 
+                                          n_upstream = 5)
+  
+  # Run XGBoost feature selection
+  fs_result <- select_top_gages_xgb(
+    data = pool_model_data,
+    pool_name = p,
+    candidate_gages = candidate_gages,
+    n_top = 6,  # Following Asborno et al. approach
+    verbose = TRUE
+  )
+  
+  if(!is.null(fs_result)) {
+    pool_feature_selection[[p]] <- fs_result
+  }
+}
+
+cat("\nFeature selection complete for", length(pool_feature_selection), "pools\n")
+```
+
+---
+
+## Step 6: Visualize Feature Importance Results
+
+```{r visualize_feature_importance, fig.width=12, fig.height=10}
+# ============================================================
+# CREATE FEATURE IMPORTANCE VISUALIZATIONS
+# ============================================================
+
+# Compile all importance results into one dataframe
+all_importance <- bind_rows(lapply(names(pool_feature_selection), function(p) {
+  pool_feature_selection[[p]]$importance %>%
+    mutate(Pool = p) %>%
+    head(10)  # Top 10 per pool
+}))
+
+# Plot 1: Importance heatmap across pools
+importance_wide <- all_importance %>%
+  select(Pool, Feature, Gain) %>%
+  pivot_wider(names_from = Pool, values_from = Gain, values_fill = 0)
+
+importance_matrix <- importance_wide %>%
+  select(-Feature) %>%
+  as.matrix()
+rownames(importance_matrix) <- importance_wide$Feature
+
+# Heatmap
+if(nrow(importance_matrix) > 0) {
+  png("./outputs/feature_selection/Feature_Importance_Heatmap.png", 
+      width = 12, height = 10, units = "in", res = 300)
+  
+  heatmap(importance_matrix, 
+          main = "Gage Importance by Pool (XGBoost Gain)",
+          xlab = "Pool", ylab = "Gage",
+          col = colorRampPalette(c("white", "steelblue", "darkblue"))(100),
+          margins = c(8, 10))
+  
+  dev.off()
+  cat("Saved: Feature_Importance_Heatmap.png\n")
+}
+
+# Plot 2: Top features per pool (faceted bar chart)
+top_features_plot <- all_importance %>%
+  group_by(Pool) %>%
+  slice_head(n = 6) %>%
+  ungroup() %>%
+  ggplot(aes(x = reorder(Feature, Gain), y = Gain, fill = Gain)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~Pool, scales = "free_y", ncol = 3) +
+  scale_fill_viridis_c(option = "plasma") +
+  labs(
+    title = "XGBoost Feature Importance by Pool",
+    subtitle = "Top 6 predictive gages for each pool (by Gain)",
+    x = "Gage / Feature",
+    y = "Importance (Gain)",
+    caption = "Gain = average improvement in prediction when feature is used"
+  ) +
+  theme_minimal() +
+  theme(
+    strip.text = element_text(face = "bold", size = 10),
+    axis.text.y = element_text(size = 8),
+    legend.position = "none"
+  )
+
+print(top_features_plot)
+ggsave("./outputs/feature_selection/Feature_Importance_ByPool.png", 
+       top_features_plot, width = 14, height = 10, dpi = 300)
+```
+
+```{r feature_selection_summary}
+# ============================================================
+# SUMMARY TABLE: SELECTED GAGES BY POOL
+# ============================================================
+
+feature_selection_summary <- bind_rows(lapply(names(pool_feature_selection), function(p) {
+  fs <- pool_feature_selection[[p]]
+  data.frame(
+    Pool = p,
+    N_Candidates = length(fs$all_candidates),
+    N_Selected = length(fs$top_gages),
+    Selected_Gages = paste(fs$top_gages, collapse = ", "),
+    Top_Gage = fs$importance$Feature[1],
+    Top_Gage_Gain = round(fs$importance$Gain[1], 4),
+    stringsAsFactors = FALSE
+  )
+}))
+
+cat("\n=== FEATURE SELECTION SUMMARY ===\n")
+print(feature_selection_summary)
+
+# Save summary
+write_csv(feature_selection_summary, "./outputs/feature_selection/Selected_Gages_ByPool.csv")
+```
+
+---
+
+## Step 7: Train Pool Models Using Selected Features
+
+Now train the final models using ONLY the top gages identified by feature selection.
+
+```{r train_pool_models}
+# ============================================================
+# TRAIN POOL MODELS WITH SELECTED FEATURES
+# Includes both regression (shoaling rate) and classification (dredge need)
+# ============================================================
+
+train_pool_model <- function(data, pool_name, selected_gages, 
+                              train_prop = 0.80, verbose = TRUE) {
+  
+  if(verbose) cat(sprintf("\n========== Training Model: Pool %s ==========\n", pool_name))
+  
+  # Filter to this pool
+  pool_data <- data %>%
+    filter(pool == pool_name) %>%
+    arrange(SurveyDateAfter)
+  
+  # Check for available selected gages
+ available_gages <- intersect(selected_gages, names(pool_data))
+  
+  if(length(available_gages) == 0) {
+    if(verbose) cat("  ERROR: No selected gages found in data\n")
+    return(NULL)
+  }
+  
+  # Prepare feature set (selected gages + WeekOfYear)
+  model_data <- pool_data %>%
+    select(
+      Pool_ShoalingRate_ftyr,  # Regression target
+      Dredge_Need,              # Classification target
+      WeekOfYear,               # Temporal feature (always included)
+      all_of(available_gages)   # ONLY selected gages from feature selection
+    ) %>%
+    drop_na()
+  
+  if(nrow(model_data) < 40) {
+    if(verbose) cat(sprintf("  Insufficient data after NA removal (n=%d)\n", nrow(model_data)))
+    return(NULL)
+  }
+  
+  if(verbose) {
+    cat(sprintf("  Observations: %d\n", nrow(model_data)))
+    cat(sprintf("  Features: WeekOfYear + %d selected gages\n", length(available_gages)))
+    cat(sprintf("  Selected gages: %s\n", paste(available_gages, collapse = ", ")))
+  }
+  
+  # Temporal train/test split
+  n <- nrow(model_data)
+  train_end <- floor(n * train_prop)
+  
+  train_idx <- 1:train_end
+  test_idx <- (train_end + 1):n
+  
+  train_data <- model_data[train_idx, ]
+  test_data <- model_data[test_idx, ]
+  
+  if(verbose) cat(sprintf("  Train: %d, Test: %d\n", length(train_idx), length(test_idx)))
+  
+  results <- list(
+    pool = pool_name,
+    selected_gages = available_gages,
+    n_train = length(train_idx),
+    n_test = length(test_idx)
+  )
+  
+  # ==================== REGRESSION MODEL ====================
+  if(verbose) cat("\n  Training REGRESSION model (shoaling rate)...\n")
+  
+  X_train_reg <- as.matrix(train_data %>% select(-Pool_ShoalingRate_ftyr, -Dredge_Need))
+  y_train_reg <- train_data$Pool_ShoalingRate_ftyr
+  X_test_reg <- as.matrix(test_data %>% select(-Pool_ShoalingRate_ftyr, -Dredge_Need))
+  y_test_reg <- test_data$Pool_ShoalingRate_ftyr
+  
+  dtrain_reg <- xgb.DMatrix(data = X_train_reg, label = y_train_reg)
+  dtest_reg <- xgb.DMatrix(data = X_test_reg, label = y_test_reg)
+  
+  set.seed(118)
+  xgb_reg <- xgb.train(
+    params = list(
+      objective = "reg:squarederror",
+      max_depth = 5,
+      eta = 0.1,
+      subsample = 0.8,
+      colsample_bytree = 0.8
+    ),
+    data = dtrain_reg,
+    nrounds = 150,
+    watchlist = list(train = dtrain_reg, test = dtest_reg),
+    early_stopping_rounds = 20,
+    verbose = 0
+  )
+  
+  reg_pred <- predict(xgb_reg, dtest_reg)
+  results$reg_rmse <- sqrt(mean((reg_pred - y_test_reg)^2))
+  results$reg_mae <- mean(abs(reg_pred - y_test_reg))
+  results$reg_r2 <- cor(reg_pred, y_test_reg)^2
+  results$reg_model <- xgb_reg
+  results$reg_predictions <- data.frame(actual = y_test_reg, predicted = reg_pred)
+  
+  if(verbose) {
+    cat(sprintf("    RMSE: %.4f ft/yr\n", results$reg_rmse))
+    cat(sprintf("    MAE:  %.4f ft/yr\n", results$reg_mae))
+    cat(sprintf("    R²:   %.4f\n", results$reg_r2))
+  }
+  
+  # ==================== CLASSIFICATION MODEL ====================
+  if(verbose) cat("\n  Training CLASSIFICATION model (dredge need)...\n")
+  
+  train_class <- train_data %>% select(-Pool_ShoalingRate_ftyr)
+  test_class <- test_data %>% select(-Pool_ShoalingRate_ftyr)
+  
+  # Check class balance
+  class_balance <- table(train_class$Dredge_Need)
+  if(verbose) cat(sprintf("    Class balance - No: %d, Yes: %d\n", 
+                          class_balance["No"], class_balance["Yes"]))
+  
+  ctrl <- trainControl(
+    method = "cv",
+    number = 5,
+    classProbs = TRUE,
+    summaryFunction = twoClassSummary
+  )
+  
+  set.seed(118)
+  xgb_class <- train(
+    Dredge_Need ~ .,
+    data = train_class,
+    method = "xgbTree",
+    trControl = ctrl,
+    tuneLength = 3,
+    metric = "ROC",
+    verbose = FALSE
+  )
+  
+  class_pred <- predict(xgb_class, test_class)
+  class_prob <- predict(xgb_class, test_class, type = "prob")
+  
+  cm <- confusionMatrix(class_pred, test_class$Dredge_Need, positive = "Yes")
+  
+  results$class_accuracy <- cm$overall["Accuracy"]
+  results$class_recall <- cm$byClass["Sensitivity"]      # True positive rate
+  results$class_precision <- cm$byClass["Pos Pred Value"] # Positive predictive value
+  results$class_specificity <- cm$byClass["Specificity"]  # True negative rate
+  results$class_f1 <- 2 * (results$class_precision * results$class_recall) / 
+                      (results$class_precision + results$class_recall)
+  results$class_model <- xgb_class
+  results$class_probabilities <- class_prob$Yes
+  results$confusion_matrix <- cm
+  
+  if(verbose) {
+    cat(sprintf("    Accuracy:  %.3f\n", results$class_accuracy))
+    cat(sprintf("    Recall:    %.3f (of actual YES, %% caught)\n", results$class_recall))
+    cat(sprintf("    Precision: %.3f (of predicted YES, %% correct)\n", results$class_precision))
+    cat(sprintf("    F1 Score:  %.3f\n", results$class_f1))
+  }
+  
+  return(results)
+}
+
+# ============================================================
+# TRAIN MODELS FOR ALL POOLS
+# ============================================================
+
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║           TRAINING POOL MODELS WITH SELECTED FEATURES            ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n")
+
+pool_models <- list()
+
+for(p in names(pool_feature_selection)) {
+  
+  # Get selected gages from feature selection
+  selected_gages <- pool_feature_selection[[p]]$top_gages
+  
+  # Train model
+  model_result <- tryCatch(
+    train_pool_model(
+      data = pool_model_data,
+      pool_name = p,
+      selected_gages = selected_gages,
+      train_prop = 0.80,
+      verbose = TRUE
+    ),
+    error = function(e) {
+      cat(sprintf("  ERROR for pool %s: %s\n", p, e$message))
+      return(NULL)
+    }
+  )
+  
+  if(!is.null(model_result)) {
+    pool_models[[p]] <- model_result
+  }
+}
+
+cat("\n\nModels trained successfully for", length(pool_models), "pools\n")
+```
+
+---
+
+## Step 8: Compile and Display Results
+
+```{r compile_results}
+# ============================================================
+# COMPILE ALL RESULTS INTO SUMMARY TABLES
+# ============================================================
+
+# Regression results
+regression_results <- bind_rows(lapply(names(pool_models), function(p) {
+  m <- pool_models[[p]]
+  data.frame(
+    Pool = p,
+    N_Train = m$n_train,
+    N_Test = m$n_test,
+    RMSE = round(m$reg_rmse, 4),
+    MAE = round(m$reg_mae, 4),
+    R_Squared = round(m$reg_r2, 4),
+    Selected_Gages = paste(m$selected_gages, collapse = ", "),
+    stringsAsFactors = FALSE
+  )
+})) %>%
+  arrange(RMSE)
+
+cat("\n=== REGRESSION MODEL RESULTS (Shoaling Rate Prediction) ===\n")
+print(regression_results %>% select(Pool, N_Test, RMSE, MAE, R_Squared))
+
+# Classification results
+classification_results <- bind_rows(lapply(names(pool_models), function(p) {
+  m <- pool_models[[p]]
+  data.frame(
+    Pool = p,
+    N_Train = m$n_train,
+    N_Test = m$n_test,
+    Accuracy = round(m$class_accuracy, 3),
+    Recall = round(m$class_recall, 3),
+    Precision = round(m$class_precision, 3),
+    F1_Score = round(m$class_f1, 3),
+    stringsAsFactors = FALSE
+  )
+})) %>%
+  arrange(desc(Recall))
+
+cat("\n=== CLASSIFICATION MODEL RESULTS (Dredge Need Prediction) ===\n")
+print(classification_results %>% select(Pool, N_Test, Accuracy, Recall, Precision, F1_Score))
+
+# Save results
+write_csv(regression_results, "./outputs/models/Regression_Results_ByPool.csv")
+write_csv(classification_results, "./outputs/models/Classification_Results_ByPool.csv")
+```
+
+---
+
+## Step 9: Generate Current Predictions for Mapping
+
+```{r generate_predictions}
+# ============================================================
+# GENERATE PREDICTIONS FOR MOST RECENT DATA
+# This is what dredge managers will use
+# ============================================================
+
+generate_current_predictions <- function(pool_models, current_gage_data) {
+  
+  predictions <- data.frame()
+  
+  for(pool_name in names(pool_models)) {
+    
+    model <- pool_models[[pool_name]]
+    selected_gages <- model$selected_gages
+    
+    # Get most recent gage data
+    latest <- current_gage_data %>%
+      filter(!is.na(Date)) %>%
+      slice_tail(n = 1) %>%
+      mutate(WeekOfYear = week(Date))
+    
+    # Check if we have all needed gages
+    available <- intersect(selected_gages, names(latest))
+    if(length(available) < length(selected_gages)) next
+    
+    # Prepare prediction data
+    pred_data <- latest %>%
+      select(WeekOfYear, all_of(selected_gages))
+    
+    if(any(is.na(pred_data))) next
+    
+    # Classification prediction (probability)
+    dredge_prob <- predict(model$class_model, pred_data, type = "prob")$Yes
+    
+    # Regression prediction (shoaling rate)
+    X_pred <- as.matrix(pred_data)
+    shoaling_pred <- predict(model$reg_model, X_pred)
+    
+    predictions <- bind_rows(predictions, data.frame(
+      Pool = pool_name,
+      Prediction_Date = as.character(latest$Date),
+      Dredge_Probability_Pct = round(dredge_prob * 100, 1),
+      Predicted_ShoalingRate_ftyr = round(shoaling_pred, 3),
+      Priority = case_when(
+        dredge_prob >= 0.70 ~ "HIGH",
+        dredge_prob >= 0.40 ~ "MEDIUM",
+        TRUE ~ "LOW"
+      ),
+      stringsAsFactors = FALSE
+    ))
+  }
+  
+  return(predictions %>% arrange(desc(Dredge_Probability_Pct)))
+}
+
+current_predictions <- generate_current_predictions(pool_models, gage_data_interpolated)
+
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║           CURRENT DREDGE NEED PREDICTIONS BY POOL                ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n\n")
+
+print(current_predictions)
+
+# Add recommendations
+current_predictions <- current_predictions %>%
+  mutate(
+    Recommendation = case_when(
+      Priority == "HIGH" ~ "Schedule survey & prepare dredge plant",
+      Priority == "MEDIUM" ~ "Monitor conditions, plan contingency",
+      Priority == "LOW" ~ "Routine monitoring only"
+    )
+  )
+
+write_csv(current_predictions, "./outputs/maps/Current_Dredge_Predictions.csv")
+```
+
+---
+
+## Step 10: Create Mapping Products for Stakeholders
+
+```{r create_maps, fig.width=12, fig.height=8}
+# ============================================================
+# PRIORITY BAR CHART FOR DREDGE MANAGERS
+# ============================================================
+
+create_priority_chart <- function(predictions) {
+  
+  predictions <- predictions %>%
+    mutate(
+      Priority = factor(Priority, levels = c("LOW", "MEDIUM", "HIGH")),
+      Pool = factor(Pool, levels = Pool[order(Dredge_Probability_Pct)])
+    )
+  
+  p <- ggplot(predictions, aes(x = Pool, y = Dredge_Probability_Pct, fill = Priority)) +
+    geom_col(width = 0.7, color = "black", size = 0.3) +
+    geom_hline(yintercept = c(40, 70), linetype = "dashed", color = "gray40", size = 0.5) +
+    geom_text(aes(label = paste0(Dredge_Probability_Pct, "%")), 
+              hjust = -0.1, size = 3.5, fontface = "bold") +
+    coord_flip() +
+    scale_fill_manual(
+      values = c("LOW" = "#4CAF50", "MEDIUM" = "#FFC107", "HIGH" = "#F44336"),
+      labels = c("LOW (<40%)", "MEDIUM (40-70%)", "HIGH (>70%)")
+    ) +
+    scale_y_continuous(limits = c(0, 110), breaks = seq(0, 100, 20)) +
+    labs(
+      title = "Predicted Dredging Need by Pool",
+      subtitle = "USACE Rock Island District - Upper Mississippi River & Illinois Waterway",
+      x = "Pool",
+      y = "Probability of Dredging Need (%)",
+      fill = "Priority Level",
+      caption = paste("Prediction Date:", Sys.Date(), 
+                      "| Model: XGBoost with pool-specific gage selection")
+    ) +
+    theme_minimal(base_size = 12) +
+    theme(
+      plot.title = element_text(size = 16, face = "bold"),
+      plot.subtitle = element_text(size = 11, color = "gray40"),
+      axis.text = element_text(size = 10),
+      legend.position = "bottom",
+      panel.grid.major.y = element_blank()
+    )
+  
+  return(p)
+}
+
+priority_chart <- create_priority_chart(current_predictions)
+print(priority_chart)
+
+ggsave("./outputs/maps/Pool_Priority_Chart.png", priority_chart, 
+       width = 12, height = 8, dpi = 300)
+
+
+# ============================================================
+# STAKEHOLDER SUMMARY TABLE
+# ============================================================
+
+stakeholder_summary <- current_predictions %>%
+  select(
+    Pool,
+    `Dredge Probability (%)` = Dredge_Probability_Pct,
+    `Predicted Shoaling (ft/yr)` = Predicted_ShoalingRate_ftyr,
+    Priority,
+    Recommendation
+  )
+
+cat("\n=== STAKEHOLDER SUMMARY TABLE ===\n")
+print(stakeholder_summary)
+
+write_csv(stakeholder_summary, "./outputs/maps/Stakeholder_Summary.csv")
+```
+
+---
+
+## Step 11: Feature Importance Interpretation
+
+```{r interpret_importance}
+# ============================================================
+# WHAT THE XGBOOST IMPORTANCE METRICS MEAN
+# ============================================================
+
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════╗\n")
+cat("║           INTERPRETING XGBOOST FEATURE IMPORTANCE                ║\n")
+cat("╚══════════════════════════════════════════════════════════════════╝\n\n")
+
+cat("XGBoost provides THREE importance metrics:\n\n")
+
+cat("1. GAIN (Most Important for Your Analysis)\n")
+cat("   - Definition: Average reduction in prediction error when this gage is used\n")
+cat("   - Interpretation: Higher Gain = more predictive power\n")
+cat("   - Example: If MI16 has Gain = 0.45, it contributes ~45% of prediction accuracy\n\n")
+
+cat("2. COVER\n")
+cat("   - Definition: Average number of samples affected by splits on this gage\n")
+cat("   - Interpretation: Higher Cover = more broadly useful across the data\n")
+cat("   - Example: A gage with high Cover affects many predictions\n\n")
+
+cat("3. FREQUENCY\n")
+cat("   - Definition: How often this gage appears in the decision trees\n")
+cat("   - Interpretation: Higher Frequency = used in more splitting decisions\n")
+cat("   - Note: Can be misleading - a frequently used gage may have small effects\n\n")
+
+cat("RECOMMENDATION: Focus on GAIN for gage selection\n\n")
+
+# Show top gage by Gain for each pool
+cat("=== TOP PREDICTIVE GAGE BY POOL ===\n")
+for(p in names(pool_feature_selection)) {
+  fs <- pool_feature_selection[[p]]
+  top_gage <- fs$importance$Feature[1]
+  top_gain <- round(fs$importance$Gain[1], 3)
+  cat(sprintf("  Pool %s: %s (Gain = %.3f)\n", p, top_gage, top_gain))
+}
+```
+
+---
+
+## Final Summary
+
+```{r final_summary}
+cat("\n")
+cat("╔══════════════════════════════════════════════════════════════════════════╗\n")
+cat("║                      POOL-BASED MODELING COMPLETE                        ║\n")
+cat("╠══════════════════════════════════════════════════════════════════════════╣\n")
+cat("║                                                                          ║\n")
+cat(sprintf("║  Pools Modeled: %-50s  ║\n", length(pool_models)))
+cat("║                                                                          ║\n")
+cat("║  OUTPUT FILES GENERATED:                                                 ║\n")
+cat("║    ./outputs/feature_selection/Selected_Gages_ByPool.csv                 ║\n")
+cat("║    ./outputs/feature_selection/Feature_Importance_ByPool.png             ║\n")
+cat("║    ./outputs/models/Regression_Results_ByPool.csv                        ║\n")
+cat("║    ./outputs/models/Classification_Results_ByPool.csv                    ║\n")
+cat("║    ./outputs/maps/Current_Dredge_Predictions.csv                         ║\n")
+cat("║    ./outputs/maps/Pool_Priority_Chart.png                                ║\n")
+cat("║    ./outputs/maps/Stakeholder_Summary.csv                                ║\n")
+cat("║                                                                          ║\n")
+cat("║  WORKFLOW SUMMARY:                                                       ║\n")
+cat("║    1. Aggregated reach-level shoaling to pool level                      ║\n")
+cat("║    2. XGBoost feature selection identified top 6 gages per pool          ║\n")
+cat("║    3. Trained regression models (predict shoaling rate ft/yr)            ║\n")
+cat("║    4. Trained binary classifiers (predict dredge need Yes/No)            ║\n")
+cat("║    5. Generated priority maps for dredge coordinators                    ║\n")
+cat("║                                                                          ║\n")
+cat("║  KEY FINDINGS:                                                           ║\n")
+cat(sprintf("║    - Best regression RMSE: %.4f ft/yr (Pool %s)                        ║\n",
+            min(regression_results$RMSE), 
+            regression_results$Pool[which.min(regression_results$RMSE)]))
+cat(sprintf("║    - Best classification recall: %.3f (Pool %s)                         ║\n",
+            max(classification_results$Recall, na.rm = TRUE),
+            classification_results$Pool[which.max(classification_results$Recall)]))
+cat("║                                                                          ║\n")
+cat("╚══════════════════════════════════════════════════════════════════════════╝\n")
+
+# Clean up parallel processing
+stopCluster(cl)
+```
