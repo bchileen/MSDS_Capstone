@@ -70,7 +70,7 @@ CSAT_data <- read_csv("CSAT_DATA_Combined.csv", show_col_types = FALSE)
 #### The gage metadata contains spatial information about the river gages
 gage_metadata <- read_csv("gage_metadata.csv", show_col_types = FALSE)
 
-### LEts take a brief look at the data
+### Lets take a brief look at the data
 glimpse(gage_data)
 glimpse(CSAT_data)
 glimpse(gage_metadata)
@@ -194,6 +194,7 @@ histogram(CSAT_data_cleaned$rate_reliability)
 
 ### Check Missing Values
 ```{r}
+### Lets look at missing values in the non-date related variables
 gage_missing <- gage_data_interpolated |>
   select(-Date, -Year, -Month, -Day, -WeekOfYear, -Season) |>
   summarise_all(~sum(is.na(.))) |>
@@ -255,7 +256,7 @@ target_plots$dist <- gage_CSAT_joined |>
        y = "Frequency") +
   theme_minimal()
 
-# 2. Time series
+# Full time series 
 target_plots$ts <- gage_CSAT_joined |>
   ggplot(aes(x = SurveyDateAfter, y = AnnualShoalingRate_ftperyr)) +
   geom_line(alpha = 0.6, color = "darkblue") +
@@ -268,8 +269,8 @@ target_plots$ts <- gage_CSAT_joined |>
 
 # 3. Seasonal patterns
 target_plots$seasonal <- gage_CSAT_joined |>
-  group_by(Month, river) %>%
-  summarise(avg_shoaling = mean(AnnualShoalingRate_ftperyr, na.rm = TRUE), .groups = "drop") %>%
+  group_by(Month, river) |>
+  summarise(avg_shoaling = mean(AnnualShoalingRate_ftperyr, na.rm = TRUE), .groups = "drop") |>
   ggplot(aes(x = Month, y = avg_shoaling, color = river)) +
   geom_line(size = 1) +
   geom_point(size = 2) +
@@ -287,18 +288,20 @@ ggplot(gage_CSAT_joined,aes(x = SurveyDateAfter, y = AnnualShoalingRate_ftperyr)
          geom_line()+ 
   facet_wrap(~pool)
 
-sd(Miss_data$AnnualShoalingRate_ftperyr)
 
 ```
 
 
 ### Correlation Matrix
 ```{r}
+### Select all numeric predictors, exclude annual shoaling rate since that's what
+### were trying to model and use the cor function to make a correlation matrix
 cor_matrix<-gage_CSAT_joined|>
   select(where(is.numeric),-AnnualShoalingRate_ftperyr)|>
   cor(use = "pairwise.complete.obs")
 cor_matrix
 
+### Select the highly correlated pairs and store in a dataframe
 high_cor_pairs<- function(cor_mat, threshold = 0.9){
   cor_mat[lower.tri(cor_mat)] <- NA
   diag(cor_mat) <- NA
@@ -318,15 +321,20 @@ high_cor_pairs<- function(cor_mat, threshold = 0.9){
 
 high_cors<-high_cor_pairs(cor_matrix, 0.9)
 
+### Omit self-correlated variables 
 filtered_cors<- high_cors |>
   filter(var1 != var2)
 
+### Plot the corrplot 
 library(corrplot)
 corrplot(cor_matrix, tl.cex = 0.5, type = "upper")
 ```
 
 ### Create Temporal Splits
 ```{r}
+### One of the key portions of this modeling is to make temporal splits since
+### this is a forecasting application. Lets use a 70/15/15 training, validation,
+### testing split.\
 create_temporal_splits <- function(data, train_prop = 0.70, val_prop = 0.15) {
 
 # Ensure data is sorted by date
@@ -362,9 +370,12 @@ create_temporal_splits <- function(data, train_prop = 0.70, val_prop = 0.15) {
 }
 
 IWW_data <- gage_CSAT_joined |>
-   filter(river == "IL")
+   filter(river == "IL")|>
+  mutate(pool = as.factor(pool))
 Miss_data <- gage_CSAT_joined |>
-  filter(river == "UM")
+  filter(river == "UM")|>
+    mutate(pool = as.factor(pool))
+
 
 cat("\n=== CREATING TEMPORAL SPLITS ===\n")
 cat("\nIllinois Waterway:\n")
@@ -375,7 +386,6 @@ Miss_splits <- create_temporal_splits(Miss_data)
 
 cat("\nCombined Rivers:\n")
 Combined_splits <- create_temporal_splits(gage_CSAT_joined)
-
 ```
 ### Baseline Model 
 ```{r}
@@ -429,7 +439,7 @@ create_time_series_baselines <- function(data, splits, dataset_name) {
     Test_RMSE = c(persistence_rmse, mean_rmse, arima_rmse),
     Test_MAE = c(persistence_mae, mean_mae, arima_mae),
     Dataset = dataset_name
-  ) %>%
+  ) |>
     arrange(Test_RMSE)
   
   cat("\nBaseline Performance:\n")
@@ -452,7 +462,8 @@ create_time_series_baselines <- function(data, splits, dataset_name) {
 # Create baselines for each dataset
 IWW_baselines <- create_time_series_baselines(IWW_data, IWW_splits, "Illinois Waterway")
 Miss_baselines <- create_time_series_baselines(Miss_data, Miss_splits, "Mississippi River")
-Combined_baselines <- create_time_series_baselines(gage_CSAT_joined, Combined_splits, "Combined")
+Combined_baselines <- create_time_series_baselines(gage_CSAT_joined |>
+                                                     mutate(pool = as.factor(pool)), Combined_splits, "Combined")
 
 IWW_baselines$results
 Miss_baselines$results
@@ -790,34 +801,35 @@ get_top_loadings <- function(pca_object, pc_num = 1, n_vars = 8) {
     Variable = rownames(pca_object$rotation),
     Loading = pca_object$rotation[, pc_num],
     Abs_Loading = abs(pca_object$rotation[, pc_num])
-  ) %>%
-    arrange(desc(Abs_Loading)) %>%
-    slice_head(n = n_vars) %>%
+  ) |>
+    arrange(desc(Abs_Loading)) |>
+    slice_head(n = n_vars) |>
     mutate(Rank = row_number())
   
   return(loadings_data)
 }
 
-IWW_top_loadings <- get_top_loadings(IWW_PCA) %>% mutate(Analysis = "IWW Only")
-Miss_top_loadings <- get_top_loadings(Miss_PCA) %>% mutate(Analysis = "Mississippi Only")
-Combined_top_loadings <- get_top_loadings(Combined_PCA) %>% mutate(Analysis = "Combined")
+IWW_top_loadings <- get_top_loadings(IWW_PCA) |>
+  mutate(Analysis = "IWW Only")
+Miss_top_loadings <- get_top_loadings(Miss_PCA) |> mutate(Analysis = "Mississippi Only")
+Combined_top_loadings <- get_top_loadings(Combined_PCA)|> mutate(Analysis = "Combined")
 
 all_top_loadings <- bind_rows(IWW_top_loadings, Miss_top_loadings, Combined_top_loadings)
 
 cat("\n=== TOP PC1 LOADINGS COMPARISON ===\n")
 cat("\nIWW Top Variables:\n")
-print(IWW_top_loadings %>% select(Rank, Variable, Loading))
+print(IWW_top_loadings |> select(Rank, Variable, Loading))
 
 cat("\nMississippi Top Variables:\n")
-print(Miss_top_loadings %>% select(Rank, Variable, Loading))
+print(Miss_top_loadings|>select(Rank, Variable, Loading))
 
 cat("\nCombined Top Variables:\n")
-print(Combined_top_loadings %>% select(Rank, Variable, Loading))
+print(Combined_top_loadings |> select(Rank, Variable, Loading))
 
 # LOADINGS HEATMAP COMPARISON
-loadings_heatmap_data <- all_top_loadings %>%
-  select(Variable, Loading, Analysis) %>%
-  pivot_wider(names_from = Analysis, values_from = Loading, values_fill = 0) %>%
+loadings_heatmap_data <- all_top_loadings |>
+  select(Variable, Loading, Analysis) |>
+  pivot_wider(names_from = Analysis, values_from = Loading, values_fill = 0)|>
   column_to_rownames("Variable")
 
 # Create heatmap
@@ -833,8 +845,8 @@ corrplot(as.matrix(loadings_heatmap_data),
 dev.off()
 
 # OVERLAP ANALYSIS - Which variables are important across approaches?
-variable_frequency <- all_top_loadings %>%
-  count(Variable, sort = TRUE) %>%
+variable_frequency <- all_top_loadings |>
+  count(Variable, sort = TRUE) |>
   mutate(
     Frequency = n,
     Importance = case_when(
@@ -870,7 +882,6 @@ ggsave("./PCA_Output/Variable_Importance_Overlap.png", overlap_plot, width = 10,
 ###xGBoost
 ```{r}
 cat("\n=== XGBOOST WITH TEMPORAL CROSS-VALIDATION ===\n")
-cat("CRITICAL: Using expanding window temporal CV for all datasets\n\n")
 
 train_xgboost_temporal <- function(data, splits, gages_to_use, dataset_name) {
   
@@ -878,23 +889,24 @@ train_xgboost_temporal <- function(data, splits, gages_to_use, dataset_name) {
   cat(sprintf("=== Training xGBoost: %s ===\n", dataset_name))
   
   # Prepare features
-  xgb_data <- data %>%
+  xgb_data <- data |>
     select(
       AnnualShoalingRate_ftperyr, 
       WeekOfYear,
+      pool,
       any_of(gages_to_use)
     ) |>
     drop_na()
   
   # Create temporal index for CV
-  xgb_data_temporal <- data %>%
-    drop_na() %>%
-    arrange(SurveyDateAfter) %>%
+  xgb_data_temporal <- data |>
+    drop_na() |>
+    arrange(SurveyDateAfter) |>
     mutate(temporal_index = row_number())
   
   # Extract only the features and target
-  xgb_features <- xgb_data_temporal %>%
-    select(AnnualShoalingRate_ftperyr, WeekOfYear, any_of(gages_to_use)) %>%
+  xgb_features <- xgb_data_temporal |>
+    select(AnnualShoalingRate_ftperyr, WeekOfYear,pool, any_of(gages_to_use)) |>
     drop_na()
   
   n_samples <- nrow(xgb_features)
@@ -965,8 +977,8 @@ train_xgboost_temporal <- function(data, splits, gages_to_use, dataset_name) {
   
   
   # Test set predictions
-  test_data <- data[splits$test_idx, ] %>%
-    select(AnnualShoalingRate_ftperyr, WeekOfYear,any_of(gages_to_use), SurveyDateAfter) %>%
+  test_data <- data[splits$test_idx, ] |>
+    select(AnnualShoalingRate_ftperyr, WeekOfYear,any_of(gages_to_use),pool, SurveyDateAfter) |>
     drop_na()
   
   test_pred <- predict(xgb_model, newdata = test_data)
@@ -995,9 +1007,9 @@ train_xgboost_temporal <- function(data, splits, gages_to_use, dataset_name) {
 }
 
 # Get gage IDs for each river
-IWW_gages <- gage_metadata %>% filter(River == "IWW") %>% pull(Gage_ID)
-Miss_gages <- gage_metadata %>% filter(River == "Miss") %>% pull(Gage_ID)
-All_gages <- gage_metadata %>% pull(Gage_ID)
+IWW_gages <- gage_metadata |> filter(River == "IWW") |> pull(Gage_ID)
+Miss_gages <- gage_metadata |> filter(River == "Miss") |> pull(Gage_ID)
+All_gages <- gage_metadata |> pull(Gage_ID)
 
 IWW_xgb <- train_xgboost_temporal(IWW_data, IWW_splits, IWW_gages, "Illinois Waterway")
 Miss_xgb <- train_xgboost_temporal(Miss_data, Miss_splits, Miss_gages, "Mississippi River")
@@ -1048,7 +1060,7 @@ dev.off()
 ```{r}
 ### LSTM MODEL FOR SHOALING RATE FORECASTING
 ### Temporal Forecasting for Predictive Dredging Operations
-
+library(keras)
 library(keras3)
 library(tensorflow)
 library(dplyr)
@@ -1074,14 +1086,14 @@ prepare_lstm_data_multistep <- function(data, splits, gages_to_use,
 cat(sprintf("=== Preparing LSTM Data: %s ===\n", dataset_name))
   
   # Prepare features (must be in temporal order)
-  feature_data <- data %>%
+  feature_data <- data |>
     select(
       SurveyDateAfter, 
       AnnualShoalingRate_ftperyr,
       DaysBetween,
       any_of(gages_to_use)
-    ) %>%
-    arrange(SurveyDateAfter) %>%
+    ) |>
+    arrange(SurveyDateAfter) |>
     drop_na()
   
   cat(sprintf("Data prepared: %d observations, %d features\n", 
@@ -1093,8 +1105,8 @@ cat(sprintf("=== Preparing LSTM Data: %s ===\n", dataset_name))
   }
   
   # Extract features and scale
-  gage_features <- feature_data %>%
-    select(-SurveyDateAfter, -AnnualShoalingRate_ftperyr) %>%
+  gage_features <- feature_data |>
+    select(-SurveyDateAfter, -AnnualShoalingRate_ftperyr) |>
     as.matrix()
   
   feature_means <- apply(gage_features, 2, mean, na.rm = TRUE)
@@ -1177,7 +1189,7 @@ build_lstm <- function(sequence_length, n_features, forecast_horizon) {
     layer_lstm(units = 64, return_sequences = FALSE,
                dropout = 0.2, recurrent_dropout = 0.2) |>
     layer_dense(units = 64, activation = 'relu') |>
-    layer_dropout(rate = 0.3) %>%
+    layer_dropout(rate = 0.3) |>
     # OUTPUT: forecast_horizon predictions
     layer_dense(units = forecast_horizon, activation = 'linear')
   
@@ -1318,8 +1330,8 @@ create_dredging_classification_updated <- function(predictions_df, dataset_name,
   cat(sprintf("=== %s Binary Classification ===\n", dataset_name))
   
   # Calculate trend using rolling window
-  predictions_df <- predictions_df %>%
-    arrange(date) %>%
+  predictions_df <- predictions_df |>
+    arrange(date) |>
     mutate(
       # Binary: Is shoaling rate positive?
       is_positive = actual > 0,
@@ -1377,8 +1389,8 @@ create_dredging_classification_updated <- function(predictions_df, dataset_name,
   cat("\n")
   
   # Distribution of classifications
-  class_dist <- predictions_df %>%
-    count(actual_binary) %>%
+  class_dist <- predictions_df |>
+    count(actual_binary) |>
     mutate(pct = n / sum(n) * 100)
   
   cat("Actual Distribution:\n")
@@ -1461,13 +1473,13 @@ library(gridExtra)  # For arranging multiple plots
 plot_predictions_timeseries <- function(pred_df, dataset_name, model_type) {
   
   # Reshape data for plotting
-  plot_data <- pred_df %>%
-    select(date, actual, predicted) %>%
+  plot_data <- pred_df |>
+    select(date, actual, predicted) |>
     tidyr::pivot_longer(
       cols = c(actual, predicted),
       names_to = "type",
       values_to = "shoaling_rate"
-    ) %>%
+    ) |>
     mutate(
       type = factor(type, levels = c("actual", "predicted"),
                    labels = c("Actual", "Predicted"))
@@ -1621,19 +1633,19 @@ create_faceted_comparison <- function() {
   
   # Combine all xGBoost predictions
   all_xgb_data <- bind_rows(
-    IWW_xgb$predictions %>% mutate(Dataset = "Illinois Waterway"),
-    Miss_xgb$predictions %>% mutate(Dataset = "Mississippi River"),
-    Combined_xgb$predictions %>% mutate(Dataset = "Combined")
-  ) %>%
+    IWW_xgb$predictions |> mutate(Dataset = "Illinois Waterway"),
+    Miss_xgb$predictions |> mutate(Dataset = "Mississippi River"),
+    Combined_xgb$predictions |> mutate(Dataset = "Combined")
+  ) |>
     mutate(Model = "xGBoost")
   
   # Combine LSTM predictions if they exist
   if(!is.null(IWW_lstm) && !is.null(Miss_lstm) && !is.null(Combined_lstm)) {
     all_lstm_data <- bind_rows(
-      IWW_lstm_pred_df %>% mutate(Dataset = "Illinois Waterway"),
-      Miss_lstm_pred_df %>% mutate(Dataset = "Mississippi River"),
-      Combined_lstm_pred_df %>% mutate(Dataset = "Combined")
-    ) %>%
+      IWW_lstm_pred_df |> mutate(Dataset = "Illinois Waterway"),
+      Miss_lstm_pred_df |> mutate(Dataset = "Mississippi River"),
+      Combined_lstm_pred_df |> mutate(Dataset = "Combined")
+    ) |>
       mutate(Model = "LSTM")
     
     all_data <- bind_rows(all_xgb_data, all_lstm_data)
@@ -1642,8 +1654,8 @@ create_faceted_comparison <- function() {
   }
   
   # Reshape for plotting
-  plot_data <- all_data %>%
-    select(date, actual, predicted, Dataset, Model) %>%
+  plot_data <- all_data |>
+    select(date, actual, predicted, Dataset, Model) |>
     tidyr::pivot_longer(
       cols = c(actual, predicted),
       names_to = "type",
@@ -1694,18 +1706,18 @@ cat("\n=== Plotting Complete ===\n")
 compile_all_results <- function() {
   # Regression results
   regression_results <- bind_rows(
-    IWW_baselines$results %>% mutate(River = "Illinois Waterway"),
-    Miss_baselines$results %>% mutate(River = "Mississippi River"),
-    Combined_baselines$results %>% mutate(River = "Combined"),
+    IWW_baselines$results |> mutate(River = "Illinois Waterway"),
+    Miss_baselines$results |> mutate(River = "Mississippi River"),
+    Combined_baselines$results |> mutate(River = "Combined"),
     
-    IWW_xgb$metrics %>% 
-      select(Dataset, Model, Test_RMSE, Test_MAE) %>%
+    IWW_xgb$metrics |> 
+      select(Dataset, Model, Test_RMSE, Test_MAE) |>
       mutate(River = "Illinois Waterway", Type = "ML"),
-    Miss_xgb$metrics %>%
-      select(Dataset, Model, Test_RMSE, Test_MAE) %>%
+    Miss_xgb$metrics |>
+      select(Dataset, Model, Test_RMSE, Test_MAE) |>
       mutate(River = "Mississippi River", Type = "ML"),
-    Combined_xgb$metrics %>%
-      select(Dataset, Model, Test_RMSE, Test_MAE) %>%
+    Combined_xgb$metrics |>
+      select(Dataset, Model, Test_RMSE, Test_MAE) |>
       mutate(River = "Combined", Type = "ML")
   )
   
@@ -1713,14 +1725,14 @@ compile_all_results <- function() {
   if(!is.null(IWW_lstm)) {
     regression_results <- bind_rows(
       regression_results,
-      IWW_lstm$metrics %>%
+      IWW_lstm$metrics |>
         mutate(
           Model = "LSTM",
           Test_RMSE = Test_RMSE_1Step,
           Test_MAE = Test_MAE_1Step,
           River = "Illinois Waterway",
           Type = "ML"
-        ) %>%
+        ) |>
         select(Dataset, Model, Test_RMSE, Test_MAE, River, Type)
     )
   }
@@ -1728,14 +1740,14 @@ compile_all_results <- function() {
   if(!is.null(Miss_lstm)) {
     regression_results <- bind_rows(
       regression_results,
-      Miss_lstm$metrics %>%
+      Miss_lstm$metrics |>
         mutate(
           Model = "LSTM",
           Test_RMSE = Test_RMSE_1Step,
           Test_MAE = Test_MAE_1Step,
           River = "Mississippi River",
           Type = "ML"
-        ) %>%
+        ) |>
         select(Dataset, Model, Test_RMSE, Test_MAE, River, Type)
     )
   }
@@ -1743,43 +1755,43 @@ compile_all_results <- function() {
   if(!is.null(Combined_lstm)) {
     regression_results <- bind_rows(
       regression_results,
-      Combined_lstm$metrics %>%
+      Combined_lstm$metrics |>
         mutate(
           Model = "LSTM",
           Test_RMSE = Test_RMSE_1Step,
           Test_MAE = Test_MAE_1Step,
           River = "Combined",
           Type = "ML"
-        ) %>%
+        ) |>
         select(Dataset, Model, Test_RMSE, Test_MAE, River, Type)
     )
   }
   
   # Binary classification results
   classification_results <- bind_rows(
-    IWW_xgb_binary$metrics %>% mutate(Model = "xGBoost"),
-    Miss_xgb_binary$metrics %>% mutate(Model = "xGBoost"),
-    Combined_xgb_binary$metrics %>% mutate(Model = "xGBoost")
+    IWW_xgb_binary$metrics |> mutate(Model = "xGBoost"),
+    Miss_xgb_binary$metrics |> mutate(Model = "xGBoost"),
+    Combined_xgb_binary$metrics |> mutate(Model = "xGBoost")
   )
   
   if(!is.null(IWW_lstm_binary)) {
     classification_results <- bind_rows(
       classification_results,
-      IWW_lstm_binary$metrics %>% mutate(Model = "LSTM")
+      IWW_lstm_binary$metrics |> mutate(Model = "LSTM")
     )
   }
   
   if(!is.null(Miss_lstm_binary)) {
     classification_results <- bind_rows(
       classification_results,
-      Miss_lstm_binary$metrics %>% mutate(Model = "LSTM")
+      Miss_lstm_binary$metrics |> mutate(Model = "LSTM")
     )
   }
   
   if(!is.null(Combined_lstm_binary)) {
     classification_results <- bind_rows(
       classification_results,
-      Combined_lstm_binary$metrics %>% mutate(Model = "LSTM")
+      Combined_lstm_binary$metrics |> mutate(Model = "LSTM")
     )
   }
   
@@ -1797,28 +1809,28 @@ all_compiled_results <- compile_all_results()
 
 select_best_models <- function(regression_results, classification_results) {
   # Best for regression (RMSE)
-  best_regression <- regression_results %>%
-    group_by(River) %>%
-    slice_min(Test_RMSE, n = 1) %>%
-    ungroup() %>%
+  best_regression <- regression_results |>
+    group_by(River) |>
+    slice_min(Test_RMSE, n = 1) |>
+    ungroup() |>
     mutate(Criterion = "Regression (RMSE)")
   
   # Best for classification (F1 Score)
-  best_classification <- classification_results %>%
-    group_by(Dataset) %>%
-    slice_max(F1_Score, n = 1, na_rm = TRUE) %>%
-    ungroup() %>%
-    rename(River = Dataset) %>%
+  best_classification <- classification_results |>
+    group_by(Dataset) |>
+    slice_max(F1_Score, n = 1, na_rm = TRUE) |>
+    ungroup() |>
+    rename(River = Dataset) |>
     mutate(Criterion = "Classification (F1)")
   
   # Best overall (balanced RMSE and accuracy)
-  overall_scores <- regression_results %>%
-    filter(Model %in% c("xGBoost", "LSTM")) %>%
+  overall_scores <- regression_results |>
+    filter(Model %in% c("xGBoost", "LSTM")) |>
     left_join(
-      classification_results %>%
+      classification_results |>
         select(Dataset, Model, Accuracy, F1_Score),
       by = c("River" = "Dataset", "Model" = "Model")
-    ) %>%
+    ) |>
     mutate(
       # Normalize RMSE (lower is better)
       RMSE_normalized = (max(Test_RMSE) - Test_RMSE) / (max(Test_RMSE) - min(Test_RMSE)),
@@ -1826,10 +1838,10 @@ select_best_models <- function(regression_results, classification_results) {
       Accuracy_normalized = Accuracy,
       # Combined score (equal weighting)
       Combined_Score = (RMSE_normalized + Accuracy_normalized) / 2
-    ) %>%
-    group_by(River) %>%
-    slice_max(Combined_Score, n = 1) %>%
-    ungroup() %>%
+    ) |>
+    group_by(River) |>
+    slice_max(Combined_Score, n = 1) |>
+    ungroup() |>
     mutate(Criterion = "Overall (Balanced)")
   
   return(list(
@@ -1851,9 +1863,9 @@ best_models <- select_best_models(
 ### Regression 
 for(river in unique(all_compiled_results$regression$River)) {
   
-  river_data <- all_compiled_results$regression %>%
-    filter(River == river) %>%
-    arrange(Test_RMSE) %>%
+  river_data <- all_compiled_results$regression |>
+    filter(River == river) |>
+    arrange(Test_RMSE) |>
     mutate(
       Rank = row_number(),
       Improvement_vs_Best_Baseline = sprintf("%.1f%%",
@@ -1892,12 +1904,12 @@ for(river in unique(all_compiled_results$regression$River)) {
   cat("│\n")
   
   # Summary statistics
-  best_baseline <- river_data %>% 
-    filter(Model %in% c("Persistence", "Mean", "ARIMA")) %>%
+  best_baseline <- river_data |> 
+    filter(Model %in% c("Persistence", "Mean", "ARIMA")) |>
     slice_min(Test_RMSE, n = 1)
   
-  best_ml <- river_data %>%
-    filter(Model %in% c("xGBoost", "LSTM")) %>%
+  best_ml <- river_data |>
+    filter(Model %in% c("xGBoost", "LSTM")) |>
     slice_min(Test_RMSE, n = 1)
   
   if(nrow(best_ml) > 0) {
@@ -1917,8 +1929,8 @@ for(river in unique(all_compiled_results$regression$River)) {
 ## Binary Classification
 for(river in unique(all_compiled_results$classification$Dataset)) {
   
-  river_class_data <- all_compiled_results$classification %>%
-    filter(Dataset == river) %>%
+  river_class_data <- all_compiled_results$classification |>
+    filter(Dataset == river) |>
     arrange(desc(F1_Score))
   
   cat(sprintf("┌─ %s %s\n", river, paste(rep("─", 60 - nchar(river)), collapse = "")))
@@ -1947,24 +1959,24 @@ for(river in unique(all_compiled_results$classification$Dataset)) {
 generate_recommendations <- function(river_name, regression_data, classification_data) {
 
   # Get best models
-  best_reg <- regression_data %>%
-    filter(River == river_name, Model %in% c("xGBoost", "LSTM")) %>%
+  best_reg <- regression_data |>
+    filter(River == river_name, Model %in% c("xGBoost", "LSTM")) |>
     slice_min(Test_RMSE, n = 1)
   
-  best_class <- classification_data %>%
-    filter(Dataset == river_name) %>%
+  best_class <- classification_data |>
+    filter(Dataset == river_name) |>
     slice_max(F1_Score, n = 1)
   
-  best_overall <- regression_data %>%
-    filter(River == river_name, Model %in% c("xGBoost", "LSTM")) %>%
+  best_overall <- regression_data |>
+    filter(River == river_name, Model %in% c("xGBoost", "LSTM")) |>
     left_join(
-      classification_data %>% select(Dataset, Model, Accuracy, F1_Score),
+      classification_data |> select(Dataset, Model, Accuracy, F1_Score),
       by = c("River" = "Dataset", "Model" = "Model")
-    ) %>%
+    ) |>
     mutate(
       RMSE_score = (max(Test_RMSE) - Test_RMSE) / (max(Test_RMSE) - min(Test_RMSE)),
       Combined_Score = (RMSE_score + Accuracy) / 2
-    ) %>%
+    ) |>
     slice_max(Combined_Score, n = 1)|>
     slice(1)
   
@@ -1978,9 +1990,9 @@ generate_recommendations <- function(river_name, regression_data, classification
   cat(sprintf("│    Test MAE:  %.4f ft/yr\n", best_reg$Test_MAE))
   
   # Calculate baseline improvement
-  best_baseline_rmse <- regression_data %>%
-    filter(River == river_name, Model %in% c("Persistence", "Mean", "ARIMA")) %>%
-    slice_min(Test_RMSE, n = 1) %>%
+  best_baseline_rmse <- regression_data |>
+    filter(River == river_name, Model %in% c("Persistence", "Mean", "ARIMA")) |>
+    slice_min(Test_RMSE, n = 1) |>
     pull(Test_RMSE)
   
   improvement <- (best_baseline_rmse - best_reg$Test_RMSE) / best_baseline_rmse * 100
@@ -2040,19 +2052,19 @@ generate_recommendations("Combined",
 
 ### Model Selection Summary Table 
 ```{r}
-summary_table <- all_compiled_results$regression %>%
-  filter(Model %in% c("xGBoost", "LSTM")) %>%
+summary_table <- all_compiled_results$regression |>
+  filter(Model %in% c("xGBoost", "LSTM")) |>
   left_join(
-    all_compiled_results$classification %>%
+    all_compiled_results$classification |>
       select(Dataset, Model, Accuracy, F1_Score),
     by = c("River" = "Dataset", "Model" = "Model")
-  ) %>%
-  group_by(River) %>%
+  ) |>
+  group_by(River) |>
   mutate(
     Best_RMSE = ifelse(Test_RMSE == min(Test_RMSE), "✓", ""),
     Best_Accuracy = ifelse(Accuracy == max(Accuracy, na.rm = TRUE), "✓", "")
-  ) %>%
-  ungroup() %>%
+  ) |>
+  ungroup() |>
   select(River, Model, Test_RMSE, Best_RMSE, Accuracy, Best_Accuracy, F1_Score)
 
 print(summary_table)
@@ -2073,23 +2085,23 @@ write_csv(all_compiled_results$regression, "./Final_Comparison/Final_Regression_
 write_csv(all_compiled_results$classification, "./Final_Comparison/Final_Classification_Results.csv")
 
 # Create recommendation document
-recommendations_df <- all_compiled_results$regression %>%
-  filter(Model %in% c("xGBoost", "LSTM")) %>%
+recommendations_df <- all_compiled_results$regression |>
+  filter(Model %in% c("xGBoost", "LSTM")) |>
   left_join(
-    all_compiled_results$classification %>%
+    all_compiled_results$classification |>
       select(Dataset, Model, Accuracy, Precision, Recall, F1_Score),
     by = c("River" = "Dataset", "Model" = "Model")
-  ) %>%
-  group_by(River) %>%
+  ) |>
+  group_by(River) |>
   mutate(
     RMSE_Rank = rank(Test_RMSE),
     Accuracy_Rank = rank(desc(Accuracy)),
     Overall_Rank = RMSE_Rank + Accuracy_Rank,
     Recommended = ifelse(Overall_Rank == min(Overall_Rank), "YES", "NO")
-  ) %>%
-  ungroup() %>%
+  ) |>
+  ungroup() |>
   select(River, Model, Recommended, Test_RMSE, Test_MAE, 
-         Accuracy, Precision, Recall, F1_Score) %>%
+         Accuracy, Precision, Recall, F1_Score) |>
   arrange(River, desc(Recommended))
 
 write_csv(recommendations_df, "./Final_Comparison/Model_Recommendations_By_River.csv")
@@ -2112,8 +2124,8 @@ cat(sprintf("  └─ ML Models: %d\n", total_ml_models))
 cat("\n")
 
 # Best overall performance
-best_overall <- all_compiled_results$regression %>%
-  filter(Model %in% c("xGBoost", "LSTM")) %>%
+best_overall <- all_compiled_results$regression |>
+  filter(Model %in% c("xGBoost", "LSTM")) |>
   slice_min(Test_RMSE, n = 1)
 
 cat("🏆 OVERALL BEST PERFORMER:\n")
@@ -2123,14 +2135,14 @@ cat(sprintf("   RMSE: %.4f ft/yr\n", best_overall$Test_RMSE))
 cat(sprintf("   MAE:  %.4f ft/yr\n\n", best_overall$Test_MAE))
 
 # Average improvements
-avg_improvement <- all_compiled_results$regression %>%
-  filter(Model %in% c("xGBoost", "LSTM")) %>%
-  group_by(River) %>%
+avg_improvement <- all_compiled_results$regression |>
+  filter(Model %in% c("xGBoost", "LSTM")) |>
+  group_by(River) |>
   summarise(
     Best_ML_RMSE = min(Test_RMSE),
     Best_Baseline_RMSE = min(Test_RMSE[Model %in% c("Persistence", "Mean", "ARIMA")], 
                              na.rm = TRUE)
-  ) %>%
+  ) |>
   mutate(Improvement = (Best_Baseline_RMSE - Best_ML_RMSE) / Best_Baseline_RMSE * 100)
 
 cat("📈 AVERAGE IMPROVEMENTS:\n")
@@ -2142,7 +2154,7 @@ cat(sprintf("   Combined: %.1f%% improvement over baseline\n\n",
             avg_improvement$Improvement[avg_improvement$River == "Combined"]))
 
 # Classification performance summary
-avg_classification <- all_compiled_results$classification %>%
+avg_classification <- all_compiled_results$classification |>
   summarise(
     Avg_Accuracy = mean(Accuracy, na.rm = TRUE),
     Avg_Precision = mean(Precision, na.rm = TRUE),
@@ -2164,8 +2176,8 @@ cat("    This shows increasing model complexity is justified by performance gain
 
 cat("2️⃣  Highlight river-specific patterns:\n")
 for(river in unique(recommendations_df$River)) {
-  best_model <- recommendations_df %>%
-    filter(River == river, Recommended == "YES") %>%
+  best_model <- recommendations_df |>
+    filter(River == river, Recommended == "YES") |>
     pull(Model)
   cat(sprintf("    • %s: Use %s for optimal performance\n", river, best_model))
 }
