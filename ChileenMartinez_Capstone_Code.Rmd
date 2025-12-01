@@ -1,0 +1,3068 @@
+---
+title: "Predictive Dredging Models for Upper Mississippi River and Illinois Waterway"
+subtitle: "Capstone Project - Machine Learning for Shoaling Rate Forecasting"
+author: "Barrie Chileen Martinez"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: show
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 12,
+  fig.height = 8
+)
+```
+
+# Loading in Code and Packages
+
+```{r load-packages}
+# Core data manipulation and visualization
+library(tidyverse)
+library(lubridate)
+library(knitr)
+library(kableExtra)
+
+# Machine learning frameworks
+library(caret)
+library(xgboost)
+
+# Time series and deep learning
+library(keras3)
+library(tensorflow)
+library(zoo)
+library(forecast)
+
+# Statistical analysis and visualization
+library(corrplot)
+library(ggfortify)
+library(viridis)
+library(patchwork)
+library(gridExtra)
+library(scales)
+
+# Parallel processing
+library(doParallel)
+library(foreach)
+
+```
+
+# Create Output directories and configure parallel processing
+
+```{r}
+# Set random seed for reproducibility
+set.seed(118)
+
+# Set up parallel processing
+n_cores <- max(1, detectCores() - 1)
+cl <- makeCluster(n_cores)
+registerDoParallel(cl)
+n_cores
+
+# Create output directories
+output_dirs <- c(
+"./Output",
+"./Output/PCA",
+"./Output/xGBoost",
+"./Output/LSTM",
+"./Output/Pool_Models",
+"./Output/Comparisons",
+"./Output/Maps"
+)
+
+for (dir in output_dirs) {
+dir.create(dir, showWarnings = FALSE, recursive = TRUE)
+}
+
+```
+
+# Load Raw Data
+
+```{r}
+# Load datasets
+gage_data <- read_csv("UMR_IWW_1999_2024.csv", show_col_types = FALSE)
+CSAT_data <- read_csv("CSAT_DATA_Combined.csv", show_col_types = FALSE)
+gage_metadata <- read_csv("gage_metadata.csv", show_col_types = FALSE)
+dredge_data <- read_csv("Dredge_Event_data.csv", show_col_types=FALSE)
+
+# Data Overview
+
+cat("Gage Data:\n")
+cat("Dimensions:", nrow(gage_data), "rows x", ncol(gage_data), "columns\n")
+cat("Date range:", as.character(min(dmy(gage_data$Date), na.rm = TRUE)), "to",
+    as.character(max(dmy(gage_data$Date), na.rm = TRUE)),"\n\n")
+
+cat("CSAT Data:\n")
+cat("Dimensions:", nrow(CSAT_data), "rows x", ncol(CSAT_data), "columns\n")
+cat("Shoaling rate range:", 
+    round(min(CSAT_data$AnnualShoalingRate_ftperyr, na.rm = TRUE), 3), "to",
+    round(max(CSAT_data$AnnualShoalingRate_ftperyr, na.rm = TRUE), 3), "ft/yr\n\n")
+
+cat("Gage Metadata:\n")
+cat("Total gages:", nrow(gage_metadata), "\n")
+```
+
+## Split Gages by River
+
+```{r}
+# Create gage lists for filtering
+IWW_gages <- gage_metadata |>
+filter(River == "IL") |>
+pull(Gage_ID)
+
+Miss_gages <- gage_metadata |>
+filter(River == "UM") |>
+pull(Gage_ID)
+
+All_gages <- gage_metadata |>
+pull(Gage_ID)
+
+cat("Gage counts by river:\n")
+cat("  Illinois Waterway:", length(IWW_gages), "gages\n")
+cat("  Mississippi River:", length(Miss_gages), "gages\n")
+cat("  Total:", length(All_gages), "gages\n")
+```
+
+## Clean Gage Data
+
+```{r}
+### All dates need to be made into a date object and lets create a variable for
+### season of the year and factor it. The final step is to remove any rows with 
+### an empty date since we wont be able to join them to the CSAT data
+ gage_data_cleaned <- gage_data |>
+    mutate(
+      Date = dmy(Date),
+      Year = year(Date),
+      Month = month(Date),
+      Day = yday(Date),
+      WeekOfYear = week(Date),
+      Season = case_when(
+        Month %in% c(12, 1, 2) ~ "Winter",
+        Month %in% c(3, 4, 5) ~ "Spring", 
+        Month %in% c(6, 7, 8) ~ "Summer",
+        Month %in% c(9, 10, 11) ~ "Fall"
+      ),
+      Season = factor(Season, levels = c("Winter", "Spring", "Summer", "Fall"))
+    ) |>
+    filter(!is.na(Date)) |>
+    arrange(Date)
+
+### Now lets take a look at NA counts 
+na_counts <- colSums(is.na(gage_data_cleaned))
+names<-names(gage_data_cleaned)
+cat("Missing values before interpolation:", 
+    sum(is.na(select(gage_data_cleaned, -Date, -Year, -Month, -Day, -WeekOfYear, -Season))), "\n")
+
+
+### Thats not too bad, lets try interpolating some dates. Lets use a gap of 4 
+### days which is reasonable for river gage forecasts
+gage_cols <- setdiff(names(gage_data_cleaned), c("Date", "Year", "Month", "Day", "WeekOfYear", "Season"))
+
+# Apply interpolation to each gage column
+gage_data_interpolated <- gage_data_cleaned |>
+mutate(across(
+  all_of(gage_cols),
+  ~ na.approx(.x, x = Date, maxgap = 4, na.rm = FALSE)
+))
+
+### Print the missing values pre and post interpolation
+cat("Missing values after interpolation:", 
+    sum(is.na(select(gage_data_interpolated, all_of(gage_cols)))), "\n")
+```
+
+## Clean CSAT Data
+
+```{r}
+### All dates need to be made into a date object and lets create a variable for
+### season of the year and factor it. Add additional fields for days between 
+### surveys as well as a reliability indicator. Filter empty shoaling rates and
+### make sure that the shoaling rate is <30 and the days between are within 1 year
+ CSAT_data_cleaned <- CSAT_data |>
+    mutate(
+      SurveyDateBefore = ymd(as.character(SurveyDateBefore)),
+      SurveyDateAfter = ymd(as.character(SurveyDateAfter)),
+      DaysBetween = as.numeric(SurveyDateAfter - SurveyDateBefore),
+      rate_reliability = case_when(DaysBetween <= 30 ~ 1.0,
+  DaysBetween <= 60 ~ 0.8,  # High quality
+  DaysBetween <= 180 ~ 0.6,  # Medium quality  
+  DaysBetween <= 240 ~ 0.4,  # Low quality
+  TRUE ~ 0.2  # Very low quality
+)
+    ) |>
+    filter(!is.na(AnnualShoalingRate_ftperyr), 
+           !is.infinite(AnnualShoalingRate_ftperyr),
+           abs(AnnualShoalingRate_ftperyr)<= 30, 
+           DaysBetween <= 365)
+
+```
+
+## Join the Datasets
+
+```{r join-data}
+# Join CSAT with gage data on survey date
+gage_CSAT_joined <- CSAT_data_cleaned |>
+left_join(
+  gage_data_interpolated,
+  by = c("SurveyDateBefore" = "Date")
+) |>
+select(-SurveyYear, -SurveyMonth, -SurveyWeekOfYear)
+
+# Check pool sample counts
+pool_counts <- gage_CSAT_joined |>
+group_by(pool) |>
+summarise(count = n(), .groups = "drop") |>
+arrange(desc(count))
+
+cat("Pool sample counts:\n")
+print(pool_counts)
+
+# Filter out pools with insufficient data
+pools_to_exclude <- c("AL", "LP", "BR", "CS", "24")
+gage_CSAT_joined <- gage_CSAT_joined |>
+filter(!pool %in% pools_to_exclude)
+
+cat("\nAfter filtering pools:", nrow(gage_CSAT_joined), "observations\n")
+cat("Date range:", as.character(min(gage_CSAT_joined$SurveyDateBefore)), "to",
+    as.character(max(gage_CSAT_joined$SurveyDateBefore)), "\n")
+```
+
+### Create River-Specific Datasets
+
+```{r river-datasets}
+# Split data by river system
+IWW_data <- gage_CSAT_joined |>
+filter(river == "IL") |>
+mutate(pool = as.factor(pool))
+
+Miss_data <- gage_CSAT_joined |>
+filter(river == "UM") |>
+mutate(pool = as.factor(pool))
+
+cat("Dataset sizes:\n")
+cat("  Illinois Waterway:", nrow(IWW_data), "observations\n")
+cat("  Mississippi River:", nrow(Miss_data), "observations\n")
+cat("  Combined:", nrow(gage_CSAT_joined), "observations\n")
+```
+
+# Exploratory Data Analysis
+
+## Distribution Plots
+
+```{r distrib plots, fig.height=10}
+### Lets make a series of plots to view the distribution of the data
+target_plots <- list()
+
+# Custom labels for rivers
+custom_labels <- c(
+      "IL" = "Illinois Waterway",
+      "UM" = "Mississippi River"
+    )
+
+# 1. Distribution
+target_plots$dist <- gage_CSAT_joined |>
+  ggplot(aes(x =  AnnualShoalingRate_ftperyr)) +
+  geom_histogram(bins = 50, fill = "steelblue", alpha = 0.7) +
+  geom_vline(aes(xintercept = median( AnnualShoalingRate_ftperyr, na.rm = TRUE)), 
+             color = "red", linetype = "dashed", size = 1) +
+  labs(title = "Distribution of Annual Shoaling Rate(ft/yr)",
+       x = "Annual Shoaling Rate(ft/yr)",
+       y = "Frequency") +
+  theme_minimal()
+
+# Full time series 
+target_plots$ts <- gage_CSAT_joined |>
+  ggplot(aes(x = SurveyDateBefore, y = AnnualShoalingRate_ftperyr)) +
+  geom_line(alpha = 0.6, color = "steelblue") +
+  geom_smooth(method = "loess", span = 0.3, se = FALSE, color = "red", size = 1) +
+  facet_wrap(~river, scales = "free_y", labeller = as_labeller(custom_labels)) +
+  labs(title = "Shoaling Rate Time Series by River",
+       x = "Date", y = "7-Day Average Shoaling Rate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+# 3. Seasonal patterns
+target_plots$seasonal <- gage_CSAT_joined |>
+  group_by(Month, river) |>
+  summarise(avg_shoaling = mean(AnnualShoalingRate_ftperyr, na.rm = TRUE), .groups = "drop") |>
+  ggplot(aes(x = Month, y = avg_shoaling, color = river)) +
+    scale_color_manual(values = c("IL" = "orange", "UM" = "dodgerblue"),
+    labels = c("IL" = "Illinois Waterway", "UM" = "Mississippi River"),
+    name = "River")+
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  labs(title = "Seasonal Shoaling Patterns",
+       x = "Month", y = "Average Shoaling Rate",
+       color = "River") +
+  theme_minimal()
+
+# Display plots
+grid.arrange(target_plots$dist, target_plots$seasonal, ncol = 1)
+target_plots$ts
+
+ggplot(gage_CSAT_joined,aes(x = SurveyDateBefore, y = AnnualShoalingRate_ftperyr, color = river))+
+         geom_line()+ 
+  scale_color_manual(values = c("IL" = "orange", "UM" = "dodgerblue"),
+    labels = c("IL" = "Illinois Waterway", "UM" = "Mississippi River"),
+    name = "River")+ 
+  labs(x = "Survey Date", y = "Annual Shoaling Rate (ft/yr)", title = "Annual Shoaling Rates By Pool")+
+  facet_wrap(~pool)
+
+
+```
+
+## Dredge Data Exploration (Need to establish shoaling threshold)
+
+```{r}
+dredge_clean <- dredge_data |>
+  filter(EXECYEAR >= 1999) |>
+  mutate(
+    dredge_date = as.Date(mdy_hm(DATE_START)),
+    river_code = case_when(
+      RIVER == "Illinois_Waterway" ~ "IL",
+      RIVER == "Mississippi_River" ~ "UM"),
+    pool_clean = POOL) |>
+  filter(!is.na(dredge_date))
+
+CSAT_clean <- CSAT_data_cleaned |>
+  mutate(
+    SurveyDateBefore = ymd(as.character(SurveyDateBefore)),
+    SurveyDateAfter = ymd(as.character(SurveyDateAfter)),
+    river_code = river,
+    pool_clean = pool
+  )
+
+# Match - dredge event occurred within 30 days AFTER survey ended
+CSAT_pre_dredge <- CSAT_clean |>
+  inner_join(
+    dredge_clean |> 
+      select(dredge_date, river_code, pool_clean, volume_dredged = VOLUMEDREDGED),
+    by = c("river_code", "pool_clean"),
+    relationship = "many-to-many") |>
+  mutate(days_to_dredge = as.numeric(dredge_date - SurveyDateAfter)) |>
+  filter(days_to_dredge >= 0, days_to_dredge <= 30) |>  # Within 30 days
+  group_by(across(c(-dredge_date, -volume_dredged, -days_to_dredge))) |>
+  slice_min(days_to_dredge, n = 1) |>  # Keep closest match
+  ungroup()
+
+comb_thresh = round(mean(CSAT_pre_dredge$AnnualShoalingRate_ftperyr),2)
+
+cat("Matched CSAT records:", nrow(CSAT_pre_dredge), "\n\n")
+
+# Quick histogram
+hist(CSAT_pre_dredge$AnnualShoalingRate_ftperyr, 
+     breaks = 50, 
+     main = "Shoaling Rates Before Dredge Events",
+     xlab = "Annual Shoaling Rate (ft/yr)",
+     col = "steelblue")
+abline(v = mean(CSAT_pre_dredge$AnnualShoalingRate_ftperyr, na.rm = TRUE), 
+       col = "red", lwd = 2, lty = 2)
+
+river_thresholds <- CSAT_pre_dredge |>
+  group_by(river) |>
+  summarise(
+    n_events = n(),
+    mean_rate = round(mean(AnnualShoalingRate_ftperyr, na.rm = TRUE), 2),
+    median_rate = round(median(AnnualShoalingRate_ftperyr, na.rm = TRUE), 2),
+    pct_positive = round(mean(AnnualShoalingRate_ftperyr > 0, na.rm = TRUE) * 100, 1)
+  )
+print(river_thresholds)
+
+pool_thresholds <- CSAT_pre_dredge |>
+  group_by(pool) |>
+  summarise(
+    n_events = n(),
+    mean_rate = round(mean(AnnualShoalingRate_ftperyr, na.rm = TRUE), 2),
+    median_rate = round(median(AnnualShoalingRate_ftperyr, na.rm = TRUE), 2),
+    pct_positive = round(mean(AnnualShoalingRate_ftperyr > 0, na.rm = TRUE) * 100, 1)
+  )
+print(pool_thresholds)
+
+reach_thresholds <-CSAT_pre_dredge |>
+  group_by(pool, reach) |>
+  summarise(
+    n_events = n(),
+    mean_rate = round(mean(AnnualShoalingRate_ftperyr, na.rm = TRUE), 2),
+    median_rate = round(median(AnnualShoalingRate_ftperyr, na.rm = TRUE), 2),
+    pct_positive = round(mean(AnnualShoalingRate_ftperyr > 0, na.rm = TRUE) * 100, 1)
+  )
+print(reach_thresholds)
+```
+
+## Correlation Matrix
+
+```{r corrplot, fig.height=10}
+### Select all numeric predictors, exclude annual shoaling rate since that's what
+### were trying to model and use the cor function to make a correlation matrix
+cor_matrix<-gage_CSAT_joined|>
+  select(where(is.numeric),-AnnualShoalingRate_ftperyr)|>
+  cor(use = "pairwise.complete.obs")
+cor_matrix
+
+### Select the highly correlated pairs and store in a dataframe
+high_cor_pairs<- function(cor_mat, threshold = 0.7){
+  cor_mat[lower.tri(cor_mat)] <- NA
+  diag(cor_mat) <- NA
+
+  high_cor <- which(abs(cor_mat) > threshold, arr.ind=TRUE)
+  if (nrow(high_cor) > 0) {
+    data.frame(
+      var1 = rownames(cor_mat)[high_cor[,1]],
+      var2 = rownames(cor_mat)[high_cor[,2]],
+      correlation = cor_mat[high_cor]) |>
+      arrange(desc(abs(correlation)))
+} else {
+  data.frame()
+}
+}
+
+
+high_cors<-high_cor_pairs(cor_matrix, 0.9)
+
+### Omit self-correlated variables 
+filtered_cors<- high_cors |>
+  filter(var1 != var2)
+
+### Plot the corrplot 
+library(corrplot)
+corrplot(cor_matrix, tl.cex = 0.75, type = "upper", method = "color",
+          order = "hclust", tl.col = "black")
+```
+
+## Create pool-level datasets
+
+```{r}
+### Pool statistics
+pool_samples <- CSAT_data_cleaned |>
+group_by(pool, river) |>
+summarise(
+  n_samples = n(),
+  min_date = min(SurveyDateBefore),
+  max_date = max(SurveyDateBefore),
+  avg_shoaling = mean(AnnualShoalingRate_ftperyr, na.rm = TRUE),
+  sd_shoaling = sd(AnnualShoalingRate_ftperyr, na.rm = TRUE),
+  pct_positive = mean(AnnualShoalingRate_ftperyr > 0, na.rm = TRUE),
+  .groups = "drop"
+) |>
+mutate(
+  river_name = ifelse(river == "IL", "Illinois Waterway", "Mississippi River")
+)
+
+# Summarize gage information per pool
+pool_gages <- gage_metadata |>
+filter(!is.na(Pool)) |>
+group_by(Pool, River) |>
+summarise(
+  n_gages_in_pool = n(),
+  n_main_gages = sum(GageType == "Main"),
+  n_trib_gages = sum(GageType == "Trib"),
+  min_rm = min(RiverMile),
+  max_rm = max(RiverMile),
+  .groups = "drop"
+)
+
+# Join pool information
+pool_info <- pool_samples |>
+left_join(pool_gages, by = c("pool" = "Pool", "river" = "River"))|>
+  mutate(center_rm = (min_rm + max_rm) / 2)  
+
+cat("Pool Information Summary:\n")
+print(pool_info |> select(pool, river_name, n_samples, n_gages_in_pool, pct_positive))
+
+```
+
+### Select gages upstream and within pools
+
+```{r gage selection}
+# Function to select gages relevant to a specific pool
+select_pool_gages <- function(target_pool, target_river, metadata,
+                             upstream_distance = 100,
+                             include_tributaries = TRUE) {
+
+# Get gages in the target pool
+pool_gages_df <- metadata |>
+  filter(Pool == target_pool, River == target_river)
+
+if (nrow(pool_gages_df) == 0) return(NULL)
+
+pool_max_rm <- max(pool_gages_df$RiverMile, na.rm = TRUE)
+pool_min_rm <- min(pool_gages_df$RiverMile, na.rm = TRUE)
+
+# Start with gages directly in the pool
+selected <- pool_gages_df$Gage_ID
+
+# Add upstream main channel gages
+upstream_main <- metadata |>
+  filter(
+    River == target_river,
+    GageType == "Main",
+    RiverMile > pool_max_rm,
+    RiverMile <= pool_max_rm + upstream_distance
+  ) |>
+  pull(Gage_ID)
+
+selected <- unique(c(selected, upstream_main))
+
+# Add tributary gages 
+if (include_tributaries) {
+  pool_tribs <- metadata |>
+    filter(River == target_river, GageType == "Trib", Pool == target_pool) |>
+    pull(Gage_ID)
+  
+  upstream_tribs <- metadata |>
+    filter(
+      River == target_river,
+      GageType == "Trib",
+      RiverMile > pool_max_rm,
+      RiverMile <= pool_max_rm + upstream_distance
+    ) |>
+    pull(Gage_ID)
+  
+  selected <- unique(c(selected, pool_tribs, upstream_tribs))
+}
+
+return(selected)
+}
+```
+
+### Assign gages to pools
+
+```{r}
+# Function to create complete mapping
+create_pool_gage_mapping <- function(pool_info, metadata, upstream_distance = 100) {
+
+  mapping <- list()
+  
+  for (i in 1:nrow(pool_info)) {
+    pool <- pool_info$pool[i]
+    river <- pool_info$river[i]
+    key <- paste(river, pool, sep = "_") 
+    
+    gages <- select_pool_gages(
+      target_pool = pool,
+      target_river = river,
+      metadata = metadata,
+      upstream_distance = upstream_distance
+    )
+    
+    mapping[[key]] <- list(
+      pool = pool,
+      river_code = river,
+      river_filter = river,
+      n_samples = pool_info$n_samples[i],
+      selected_gages = gages,
+      n_selected_gages = length(gages)
+    )
+  }
+  
+  return(mapping)
+}
+# Create mapping
+pool_gage_mapping <- create_pool_gage_mapping(pool_info, gage_metadata)
+
+# Display mapping summary
+mapping_summary <- data.frame(
+Key = names(pool_gage_mapping),
+Pool = sapply(pool_gage_mapping, function(x) x$pool),
+River = sapply(pool_gage_mapping, function(x) x$river_code),
+N_Samples = sapply(pool_gage_mapping, function(x) x$n_samples),
+N_Gages = sapply(pool_gage_mapping, function(x) x$n_selected_gages)
+)
+
+
+print(mapping_summary |> arrange(River, desc(N_Samples)))
+```
+
+## Principal Components Analysis
+
+### Combined PCA
+
+```{r Combined PCA}
+colSums(is.na(gage_CSAT_joined))
+
+ gage_survey_PCA <- gage_CSAT_joined |>
+ select(where(is.numeric),
+        -Year, -Month, -Day,-WeekOfYear, -SurveyDateBefore,-SurveyDateAfter,
+        -rate_reliability,-reach, -NetVolumeChange_CY, -AnnualShoalingVolume_CYperyr, -AnnualShoalingRate_ftperyr, -SurveyOverlapArea_sqft, -SurveyOverlapPctReach)
+
+# Remove rows with any missing values for PCA 
+pca_data_complete <- gage_survey_PCA |>
+  drop_na()
+
+cat("Complete cases for PCA:", nrow(pca_data_complete), "out of", nrow(gage_CSAT_joined), "\n")
+ 
+Comb_Viz <- gage_CSAT_joined |>
+  dplyr::slice(as.numeric(rownames(pca_data_complete))) |>  
+  select(SurveyDateBefore, SurveySeason, Day, Month, WeekOfYear,
+         river, pool) |>
+  mutate(
+    season = factor(SurveySeason, levels = c("Winter", "Spring", "Summer", "Fall")),
+    river_system = factor(river),
+    pool_name = factor(pool),
+    week_of_year = WeekOfYear)
+  
+
+Combined_PCA = prcomp(pca_data_complete, scale = T, center = T)
+
+#Variance Explained
+Combined_explained_variance <- summary(Combined_PCA)$importance[2, ] * 100
+Combined_cumulative_variance <- summary(Combined_PCA)$importance[3, ] * 100
+Combined_eigenvalues <- (Combined_PCA$sdev)^2
+Combined_components_kaiser <- sum(Combined_eigenvalues > 1)
+
+cat("\nCombined PCA Results:\n")
+cat("  Variance explained (PC1-5):", round(Combined_explained_variance[1:5], 2), "%\n")
+cat("  Cumulative variance (PC1-5):", round(Combined_cumulative_variance[1:5], 2), "%\n")
+cat("  Components with eigenvalue > 1:", Combined_components_kaiser, "\n")
+
+# Scree Plot
+plot(Combined_PCA,  type="l", title = "Combined PCA Scree Plot")
+
+# Biplot Function
+plot_PCA_biplot <- function(River_df, River_Viz,RiverName) {
+a<-autoplot(River_df,data = River_Viz, 
+         color = 'season',loadings = TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+  ggtitle("Season")
+
+b<-autoplot(River_df,data = River_Viz, 
+         color = 'pool',loadings= TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+  ggtitle("Pool")+
+    guides(color = guide_legend(ncol = 3))
+
+
+c<-autoplot(River_df,data = River_Viz, 
+         color = 'week_of_year',loadings = TRUE,
+             loadings.label = TRUE, # Show loading labels
+             loadings.colour = "blue", # Color loading arrows
+             loadings.label.colour = "darkblue")+
+        ggtitle("Week ")+
+  labs(color = "Week of Year?")
+
+library(patchwork)
+combined <- a + b + c + plot_layout(ncol = 3) +
+  plot_annotation(title = RiverName)
+
+return(combined)
+}
+
+Combined_Biplots <- plot_PCA_biplot(Combined_PCA,Comb_Viz, "Combined Rivers")
+
+Combined_Biplots
+
+ggsave("./Output/PCA/Combined_PCA_Biplots.png", width = 18, height = 9)
+```
+
+## River-Specific PCA
+
+```{r, fig.height=8}
+IWW_pca_data <- gage_CSAT_joined |>
+filter(river == "IL") |>
+select(any_of(IWW_gages)) |>
+drop_na()
+
+IWW_PCA <- prcomp(IWW_pca_data, scale = TRUE, center = TRUE)
+IWW_explained_variance <- summary(IWW_PCA)$importance[2, ] * 100
+IWW_cumulative_variance <- summary(IWW_PCA)$importance[3, ] * 100
+
+# Mississippi PCA
+Miss_pca_data <- gage_CSAT_joined |>
+filter(river == "UM") |>
+select(any_of(Miss_gages)) |>
+drop_na()
+
+Miss_PCA <- prcomp(Miss_pca_data, scale = TRUE, center = TRUE)
+Miss_explained_variance <- summary(Miss_PCA)$importance[2, ] * 100
+Miss_cumulative_variance <- summary(Miss_PCA)$importance[3, ] * 100
+
+# Biplots of Miss and IL
+IWW_Viz <- gage_CSAT_joined |>
+  dplyr::slice(as.numeric(rownames(IWW_pca_data))) |>  # Match rows used in PCA
+  select(SurveyDateBefore, SurveySeason, Day, Month, WeekOfYear,
+         river, pool) |>
+  mutate(
+    season = factor(SurveySeason, levels = c("Winter", "Spring", "Summer", "Fall")),
+    river_system = factor(river),
+    pool_name = factor(pool),
+    week_of_year = WeekOfYear)
+
+Miss_Viz <- gage_CSAT_joined |>
+  dplyr::slice(as.numeric(rownames(Miss_pca_data))) |>  # Match rows used in PCA
+  select(SurveyDateBefore, SurveySeason, Day, Month, WeekOfYear,
+         river, pool) |>
+  mutate(
+    season = factor(SurveySeason, levels = c("Winter", "Spring", "Summer", "Fall")),
+    river_system = factor(river),
+    pool_name = factor(pool),
+    week_of_year = WeekOfYear)
+
+
+IWW_Biplots <- plot_PCA_biplot(IWW_PCA,IWW_Viz, "Illinois Waterway")
+
+IWW_Biplots
+ggsave("./Output/PCA/IWW_PCA_Biplots.png", width = 18, height = 9)
+
+
+Miss_Biplots <- plot_PCA_biplot(Miss_PCA,Miss_Viz, "Mississippi River")
+Miss_Biplots
+ggsave("./Output/PCA/Miss_PCA_Biplots.png", width = 18, height = 9)
+
+# Comparison table
+pca_comparison <- data.frame(
+Analysis = c("IWW Only", "Mississippi Only", "Combined"),
+Observations = c(nrow(IWW_pca_data), nrow(Miss_pca_data), nrow(pca_data_complete)),
+Variables = c(ncol(IWW_pca_data), ncol(Miss_pca_data), ncol(pca_data_complete)),
+PC1_Variance = c(round(IWW_explained_variance[1], 2),
+                 round(Miss_explained_variance[1], 2),
+                 round(Combined_explained_variance[1], 2)),
+PC2_Variance = c(round(IWW_explained_variance[2], 2),
+                 round(Miss_explained_variance[2], 2),
+                 round(Combined_explained_variance[2], 2)),
+PC1_PC2_Combined = c(round(IWW_explained_variance[1] + IWW_explained_variance[2], 2),
+                     round(Miss_explained_variance[1] + Miss_explained_variance[2], 2),
+                     round(Combined_explained_variance[1] + Combined_explained_variance[2], 2))
+)
+
+cat("\nPCA Comparison Summary:\n")
+print(pca_comparison)
+
+# Variance comparison plot
+variance_data <- data.frame(
+Component = rep(1:10, 3),
+Variance = c(IWW_explained_variance[1:10],
+             Miss_explained_variance[1:10],
+             Combined_explained_variance[1:10]),
+Cumulative = c(IWW_cumulative_variance[1:10],
+               Miss_cumulative_variance[1:10],
+               Combined_cumulative_variance[1:10]),
+Analysis = rep(c("IWW Only", "Mississippi Only", "Combined"), each = 10)
+)
+
+p_var <- ggplot(variance_data, aes(x = Component, y = Variance, color = Analysis)) +
+geom_line(linewidth = 1.2) +
+geom_point(size = 3) +
+scale_color_viridis_d() +
+labs(title = "Variance Explained by Principal Components",
+    x = "Principal Component", y = "Variance Explained (%)") +
+theme_minimal()
+
+p_cum <- ggplot(variance_data, aes(x = Component, y = Cumulative, color = Analysis)) +
+geom_line(linewidth = 1.2) +
+geom_point(size = 3) +
+geom_hline(yintercept = c(80, 85, 90), linetype = "dashed", alpha = 0.5) +
+scale_color_viridis_d() +
+labs(title = "Cumulative Variance Explained",
+    x = "Principal Component", y = "Cumulative Variance (%)") +
+theme_minimal()
+
+p_var / p_cum
+
+ggsave("./Output/PCA/Variance_Comparison.png", width = 12, height = 10)
+```
+
+# Utility Functions
+
+```{r temporal-splits-function}
+create_temporal_splits <- function(data, train_prop = 0.70, val_prop = 0.15) {
+
+# Ensure data is sorted by date
+data <- data |> arrange(SurveyDateBefore)
+
+n <- nrow(data)
+train_end <- floor(n * train_prop)
+val_end <- floor(n * (train_prop + val_prop))
+
+splits <- list(
+  train_idx = 1:train_end,
+  val_idx = (train_end + 1):val_end,
+  test_idx = (val_end + 1):n,
+  train_dates = data$SurveyDateBefore[1:train_end],
+  val_dates = data$SurveyDateBefore[(train_end + 1):val_end],
+  test_dates = data$SurveyDateBefore[(val_end + 1):n]
+)
+
+cat(sprintf("Temporal splits:\n"))
+cat(sprintf("  Training: %d samples (%.1f%%) - %s to %s\n",
+            length(splits$train_idx), train_prop * 100,
+            min(splits$train_dates), max(splits$train_dates)))
+cat(sprintf("  Validation: %d samples (%.1f%%) - %s to %s\n",
+            length(splits$val_idx), val_prop * 100,
+            min(splits$val_dates), max(splits$val_dates)))
+cat(sprintf("  Test: %d samples (%.1f%%) - %s to %s\n",
+            length(splits$test_idx), (1 - train_prop - val_prop) * 100,
+            min(splits$test_dates), max(splits$test_dates)))
+
+return(splits)
+}
+
+# Create splits for each dataset
+IWW_splits <- create_temporal_splits(IWW_data)
+Miss_splits <- create_temporal_splits(Miss_data)
+Combined_splits <- create_temporal_splits(gage_CSAT_joined)
+```
+
+## Binary Classification Function (Convert shoaling rates to dredge yes/no class)
+
+```{r}
+print(river_thresholds)
+print(pool_thresholds)
+
+IWW_thresh = river_thresholds |>
+  filter(river == "IL")|>
+  pull(mean_rate)
+Miss_thresh = river_thresholds |>
+  filter(river == "UM")|>
+  pull(mean_rate)
+
+calculate_classification_metrics <- function(actual, predicted, threshold) {
+
+# Convert to binary
+actual_bin <- ifelse(actual > threshold, "YES", "NO")
+pred_bin <- ifelse(predicted > threshold, "YES", "NO")
+
+# Confusion matrix components
+TP <- sum(actual_bin == "YES" & pred_bin == "YES")
+FP <- sum(actual_bin == "NO" & pred_bin == "YES")
+FN <- sum(actual_bin == "YES" & pred_bin == "NO")
+TN <- sum(actual_bin == "NO" & pred_bin == "NO")
+
+# Metrics
+accuracy <- (TP + TN) / (TP + FP + FN + TN)
+precision <- ifelse((TP + FP) > 0, TP / (TP + FP), NA)
+recall <- ifelse((TP + FN) > 0, TP / (TP + FN), NA)
+f1 <- ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+             2 * precision * recall / (precision + recall), NA)
+
+list(
+  accuracy = accuracy,
+  precision = precision,
+  recall = recall,
+  f1 = f1,
+  confusion = table(Actual = actual_bin, Predicted = pred_bin)
+)
+}
+```
+
+# Baseline Models
+
+```{r baseline-models}
+create_baselines <- function(data, splits, dataset_name) {
+
+train_data <- data[splits$train_idx, ]
+test_data <- data[splits$test_idx, ]
+
+# Persistence baseline (naive forecast)
+persistence_pred <- c(
+  tail(train_data$AnnualShoalingRate_ftperyr, 1),
+  test_data$AnnualShoalingRate_ftperyr[-nrow(test_data)]
+)
+persistence_rmse <- sqrt(mean((persistence_pred - test_data$AnnualShoalingRate_ftperyr)^2))
+persistence_mae <- mean(abs(persistence_pred - test_data$AnnualShoalingRate_ftperyr))
+
+# Mean baseline
+mean_pred <- rep(mean(train_data$AnnualShoalingRate_ftperyr, na.rm = TRUE), nrow(test_data))
+mean_rmse <- sqrt(mean((mean_pred - test_data$AnnualShoalingRate_ftperyr)^2))
+mean_mae <- mean(abs(mean_pred - test_data$AnnualShoalingRate_ftperyr))
+
+# ARIMA baseline
+train_ts <- ts(train_data$AnnualShoalingRate_ftperyr, frequency = 12)
+arima_model <- auto.arima(train_ts, seasonal = TRUE, stepwise = TRUE,
+                          approximation = FALSE, trace = FALSE)
+arima_forecast <- forecast(arima_model, h = nrow(test_data))
+arima_pred <- as.numeric(arima_forecast$mean)
+arima_rmse <- sqrt(mean((arima_pred - test_data$AnnualShoalingRate_ftperyr)^2))
+arima_mae <- mean(abs(arima_pred - test_data$AnnualShoalingRate_ftperyr))
+
+results <- data.frame(
+  Model = c("Persistence", "Mean", "ARIMA"),
+  Test_RMSE = c(persistence_rmse, mean_rmse, arima_rmse),
+  Test_MAE = c(persistence_mae, mean_mae, arima_mae),
+  Dataset = dataset_name
+) |>
+arrange(Test_RMSE)
+
+cat("\nBaseline Performance:\n")
+print(results)
+
+return(list(
+  results = results,
+  arima_model = arima_model,
+  predictions = data.frame(
+    actual = test_data$AnnualShoalingRate_ftperyr,
+    persistence = persistence_pred,
+    mean = mean_pred,
+    arima = arima_pred,
+    date = test_data$SurveyDateBefore
+  )
+))
+}
+
+# Create baselines
+IWW_baselines <- create_baselines(IWW_data, IWW_splits, "Illinois Waterway")
+Miss_baselines <- create_baselines(Miss_data, Miss_splits, "Mississippi River")
+Combined_baselines <- create_baselines(gage_CSAT_joined |> mutate(pool = as.factor(pool)), Combined_splits, "Combined")
+```
+
+# xGBoost
+
+## River Level xGBoost
+
+### Model and Tuning Grid Set Up
+
+```{r}
+train_xgboost_temporal <- function(data, splits, gages_to_use, dataset_name, threshold) {
+
+cat(sprintf("\n Training xGBoost: %s \n", dataset_name))
+
+# Prepare features
+xgb_features <- data |>
+  select(AnnualShoalingRate_ftperyr, WeekOfYear, pool, any_of(gages_to_use)) |>
+  drop_na()
+
+n_samples <- nrow(xgb_features)
+n_folds <- 5
+
+# Create expanding window temporal folds
+temporal_indices <- lapply(1:n_folds, function(i) {
+  test_start <- floor(n_samples * i / (n_folds + 1))
+  test_end <- floor(n_samples * (i + 1) / (n_folds + 1))
+  list(train = 1:(test_start - 1), test = test_start:test_end)
+})
+
+temporal_indices <- temporal_indices[sapply(temporal_indices, function(x) length(x$train) > 50)]
+
+# Training control
+ctrl <- trainControl(
+  method = "cv",
+  number = length(temporal_indices),
+  index = lapply(temporal_indices, `[[`, "train"),
+  indexOut = lapply(temporal_indices, `[[`, "test"),
+  verboseIter = FALSE,
+  allowParallel = TRUE,
+  savePredictions = "final"
+)
+
+# Tune grid
+  tune_grid <- expand.grid(
+    nrounds = c(100, 200),
+    max_depth = c(4, 5),
+    eta = c(0.05,0.1),
+    gamma = c(0, 0.1),
+    colsample_bytree = c(0.6, 0.8),
+    min_child_weight = c(1, 3),
+    subsample = c(0.8, 1.0)
+  )
+  11
+
+cat(sprintf("Training with %d temporal CV folds...\n", length(temporal_indices)))
+
+start_time <- Sys.time()
+xgb_model <- caret::train(
+  AnnualShoalingRate_ftperyr ~ .,
+  data = xgb_features,
+  method = "xgbTree",
+  tuneGrid = tune_grid,
+  trControl = ctrl,
+  metric = "RMSE",
+  verbose = FALSE
+)
+training_time <- difftime(Sys.time(), start_time, units = "mins")
+
+cat(sprintf("Training time: %.2f minutes\n", as.numeric(training_time)))
+cat(sprintf("Best CV RMSE: %.4f\n", min(xgb_model$results$RMSE)))
+cat(sprintf("Best params: nrounds=%d, max_depth=%d, eta=%.3f\n",
+            xgb_model$bestTune$nrounds,
+            xgb_model$bestTune$max_depth,
+            xgb_model$bestTune$eta))
+
+# Test set evaluation
+test_data <- data[splits$test_idx, ] |>
+  select(AnnualShoalingRate_ftperyr, WeekOfYear, pool,
+         any_of(gages_to_use), SurveyDateBefore) |>
+  drop_na()
+
+test_pred <- predict(xgb_model, newdata = test_data)
+test_rmse <- sqrt(mean((test_pred - test_data$AnnualShoalingRate_ftperyr)^2))
+test_mae <- mean(abs(test_pred - test_data$AnnualShoalingRate_ftperyr))
+test_r2 <- cor(test_pred, test_data$AnnualShoalingRate_ftperyr)^2
+
+# Classification metrics
+class_metrics <- calculate_classification_metrics(
+  test_data$AnnualShoalingRate_ftperyr, test_pred, threshold)
+
+cat(sprintf("Test RMSE: %.4f, MAE: %.4f, R²: %.4f\n", test_rmse, test_mae, test_r2))
+cat(sprintf("Classification Accuracy: %.3f, F1: %.3f\n",
+            class_metrics$accuracy, class_metrics$f1))
+
+return(list(
+  model = xgb_model,
+  metrics = data.frame(
+    Dataset = dataset_name,
+    Model = "xGBoost",
+    CV_RMSE = min(xgb_model$results$RMSE),
+    Test_RMSE = test_rmse,
+    Test_MAE = test_mae,
+    Test_R2 = test_r2,
+    Accuracy = class_metrics$accuracy,
+    Precision = class_metrics$precision,
+    Recall = class_metrics$recall,
+    F1_Score = class_metrics$f1
+  ),
+  predictions = data.frame(
+    actual = test_data$AnnualShoalingRate_ftperyr,
+    predicted = test_pred,
+    date = test_data$SurveyDateBefore
+  ),
+  confusion = class_metrics$confusion
+))
+}
+
+```
+
+### Train the models
+
+```{r train-xgboost-river}
+# Train river-level models
+IWW_xgb <- train_xgboost_temporal(IWW_data, IWW_splits, IWW_gages, "Illinois Waterway", IWW_thresh)
+Miss_xgb <- train_xgboost_temporal(Miss_data, Miss_splits, Miss_gages, "Mississippi River",Miss_thresh)
+Combined_xgb <- train_xgboost_temporal(gage_CSAT_joined, Combined_splits, All_gages, "Combined", comb_thresh)
+```
+
+### Variable Importance
+
+```{r}
+# Extract and plot importance
+iww_imp <- xgb.importance(model = IWW_xgb$model$finalModel)
+miss_imp <- xgb.importance(model = Miss_xgb$model$finalModel)
+combined_imp <- xgb.importance(model = Combined_xgb$model$finalModel)
+
+cat("\nTop 10 Features - Illinois Waterway:\n")
+print(head(iww_imp, 10))
+
+cat("\nTop 10 Features - Mississippi River:\n")
+print(head(miss_imp, 10))
+
+# Save importance plots
+png("./Output/xGBoost/IWW_Importance.png", width = 12, height = 8, units = "in", res = 300)
+xgb.plot.importance(iww_imp[1:10, ], main = "Top 10 Features - Illinois Waterway")
+dev.off()
+
+png("./Output/xGBoost/Miss_Importance.png", width = 12, height = 8, units = "in", res = 300)
+xgb.plot.importance(miss_imp[1:10, ], main = "Top 10 Features - Mississippi River")
+dev.off()
+
+png("./Output/xGBoost/Combined_Importance.png", width = 12, height = 8, units = "in", res = 300)
+xgb.plot.importance(combined_imp[1:10, ], main = "Top 10 Features - Combined")
+dev.off()
+
+cat("\nImportance plots saved to ./Output/xGBoost/\n")
+```
+
+## Pool Level xGBoost
+
+```{r}
+train_pool_xgboost <- function(data, pool_name, river_code,
+                              pool_gage_mapping, threshold, min_samples = 40) {
+
+  key <- paste(river_code, pool_name, sep = "_")
+  
+  if (!key %in% names(pool_gage_mapping)) {
+    return(list(pool = pool_name, river = river_code, status = "no_mapping", metrics = NULL))
+  }
+  
+  pool_map <- pool_gage_mapping[[key]]
+  river_filter <- pool_map$river_filter  # Now this exists
+  selected_gages <- pool_map$selected_gages
+  
+  # Filter data for this pool
+  pool_data <- data |>
+    filter(pool == pool_name, river == river_filter) |>
+    arrange(SurveyDateBefore)
+
+if (nrow(pool_data) < min_samples) {
+  return(list(pool = pool_name, river = river_code, status = "insufficient_samples",
+              n = nrow(pool_data), metrics = NULL))
+}
+
+available_gages <- intersect(selected_gages, names(pool_data))
+
+if (length(available_gages) < 2) {
+  return(list(pool = pool_name, river = river_code, status = "insufficient_gages",
+              n_gages = length(available_gages), metrics = NULL))
+}
+
+cat(sprintf("\n--- Pool %s (%s): %d samples, %d gages ---\n",
+            pool_name, river_code, nrow(pool_data), length(available_gages)))
+
+# Prepare features
+features <- pool_data |>
+  select(AnnualShoalingRate_ftperyr, WeekOfYear, DaysBetween, all_of(available_gages)) |>
+  drop_na()
+
+if (nrow(features) < 30) {
+  return(list(pool = pool_name, river = river_code, status = "insufficient_complete",
+              n_complete = nrow(features), metrics = NULL))
+}
+
+# Temporal split
+n <- nrow(features)
+train_end <- floor(n * 0.7)
+test_start <- floor(n * 0.85) + 1
+
+train_data <- features[1:train_end, ]
+test_data <- features[test_start:n, ]
+
+if (nrow(test_data) < 5) {
+  return(list(pool = pool_name, river = river_code, status = "insufficient_test", metrics = NULL))
+}
+
+# Training
+ctrl <- trainControl(method = "cv", number = 5, verboseIter = FALSE, allowParallel = TRUE)
+
+tune_grid <- expand.grid(
+  nrounds = c(50, 100, 150),
+  max_depth = c(3, 4, 5, 6),
+  eta = c(0.05, 0.1, 0.2),
+  gamma = c(0, 0.1),
+  colsample_bytree = c(0.7, 0.9),
+  min_child_weight = c(1, 3),
+  subsample = 0.8
+)
+
+model <- tryCatch({
+  caret::train(
+    AnnualShoalingRate_ftperyr ~ .,
+    data = train_data,
+    method = "xgbTree",
+    tuneGrid = tune_grid,
+    trControl = ctrl,
+    metric = "RMSE",
+    verbose = FALSE
+  )
+}, error = function(e) {
+  cat(sprintf("  Training error: %s\n", e$message))
+  return(NULL)
+})
+
+if (is.null(model)) {
+  return(list(pool = pool_name, river = river_code, status = "training_failed", metrics = NULL))
+}
+
+# Evaluate
+pred <- predict(model, test_data)
+actual <- test_data$AnnualShoalingRate_ftperyr
+
+rmse <- sqrt(mean((pred - actual)^2))
+mae <- mean(abs(pred - actual))
+r2 <- cor(pred, actual)^2
+
+class_metrics <- calculate_classification_metrics(actual, pred, threshold)
+
+cat(sprintf("  RMSE=%.3f, Accuracy=%.1f%%, F1=%.3f\n",
+            rmse, class_metrics$accuracy * 100, class_metrics$f1))
+
+return(list(
+  pool = pool_name,
+  river = river_code,
+  status = "success",
+  model = model,
+  n_samples = nrow(pool_data),
+  n_gages = length(available_gages),
+  gages_used = available_gages,
+  metrics = data.frame(
+    Pool = pool_name,
+    River = river_code,
+    Model = "xGBoost",
+    N_Samples = nrow(pool_data),
+    N_Gages = length(available_gages),
+    Test_RMSE = rmse,
+    Test_MAE = mae,
+    Test_R2 = r2,
+    Accuracy = class_metrics$accuracy,
+    Precision = class_metrics$precision,
+    Recall = class_metrics$recall,
+    F1_Score = class_metrics$f1
+  ),
+  predictions = data.frame(actual = actual, predicted = pred),
+  confusion = class_metrics$confusion
+))
+}
+```
+
+### Run xGBoost at Pool Level
+
+```{r}
+viable_pools <- pool_info |>
+  filter(n_samples >= 40) |>
+  arrange(river, desc(n_samples))
+
+cat(sprintf("Training pool-level xGBoost for %d viable pools\n", nrow(viable_pools)))
+
+# Train models for each pool
+pool_xgb_results <- list()
+
+for (i in 1:nrow(viable_pools)) {
+  pool_name <- viable_pools$pool[i]
+  river_code <- viable_pools$river[i]  # This is "IL" or "UM"
+  
+  # Handle case where pool might not have threshold data
+ pool_threshold <- pool_thresholds |>
+    filter(pool == pool_name) |>
+    pull(mean_rate)
+  
+  # Use river threshold as fallback if pool threshold missing
+  if (length(pool_threshold) == 0) {
+    pool_threshold <- river_thresholds |>
+      filter(river == river_code) |>
+      pull(mean_rate)
+  }
+  
+  # Skip if still no threshold
+ if (length(pool_threshold) == 0) {
+    cat(sprintf("Skipping pool %s - no threshold available\n", pool_name))
+    next
+  }
+  
+  result <- train_pool_xgboost(
+    data = gage_CSAT_joined,
+    pool_name = pool_name,
+    river_code = river_code,
+    pool_gage_mapping = pool_gage_mapping,
+    threshold = pool_threshold,
+    min_samples = 40
+  )
+  
+  key <- paste(river_code, pool_name, sep = "_")
+  pool_xgb_results[[key]] <- result
+}
+
+# Compile results
+pool_xgb_metrics <- do.call(rbind, lapply(pool_xgb_results, function(x) {
+  if (!is.null(x$metrics)) x$metrics else NULL
+}))
+
+if (!is.null(pool_xgb_metrics)) {
+  print(pool_xgb_metrics |> arrange(Test_RMSE))
+}
+```
+
+# LSTM
+LSTM Model developed using Claude AI on 11/01/2025. AI was used to build out the data preparation handling and workflow and to build model architecture to correctly handle temporal splits. Other reference materials include [R Bloggers Forecasting Sunspots](https://www.r-bloggers.com/2018/04/time-series-deep-learning-forecasting-sunspots-with-keras-stateful-lstm-in-r/)  and [Time Series Forecasting with RNN](https://blogs.rstudio.com/ai/posts/2017-12-20-time-series-forecasting-with-recurrent-neural-networks/){.uri} and [LSTM Time Series Prediction in R](http://datasideoflife.com/?p=1171)
+
+## LSTM Data Preparation
+```{r lstm-data-prep-function}
+#LSTM Model with temporal gap handling
+prepare_lstm_data_fixed <- function(data, gages_to_use,
+                                   sequence_length = 30,
+                                   forecast_horizon = 45,
+                                   dataset_name = "Dataset") {
+
+cat(sprintf("\n--- Preparing LSTM Data: %s ---\n", dataset_name))
+
+# Sort and prepare data with temporal gap feature
+feature_data <- data |>
+  select(
+    SurveyDateBefore, AnnualShoalingRate_ftperyr,
+    DaysBetween, WeekOfYear, any_of(gages_to_use)
+  ) |>
+  arrange(SurveyDateBefore) |>
+  drop_na() |>
+  mutate(
+    days_since_last = as.numeric(SurveyDateBefore - lag(SurveyDateBefore)),
+    days_since_last = ifelse(is.na(days_since_last), 0, days_since_last)
+  )
+
+cat(sprintf("Initial data: %d observations\n", nrow(feature_data)))
+
+# Check minimum requirements
+min_required <- sequence_length + forecast_horizon + 20
+if (nrow(feature_data) < min_required) {
+  cat(sprintf("WARNING: Insufficient data. Need %d, have %d\n", min_required, nrow(feature_data)))
+  return(NULL)
+}
+
+# Report temporal spacing
+gap_stats <- summary(feature_data$days_since_last[-1])
+cat(sprintf("Temporal gaps (days): Min=%.0f, Median=%.0f, Mean=%.1f, Max=%.0f\n",
+            gap_stats[1], gap_stats[3], gap_stats[4], gap_stats[6]))
+
+# Extract and scale features
+gage_cols <- intersect(gages_to_use, names(feature_data))
+feature_cols <- c("DaysBetween", "WeekOfYear", "days_since_last", gage_cols)
+
+feature_matrix <- feature_data |>
+  select(all_of(feature_cols)) |>
+  as.matrix()
+
+feature_means <- colMeans(feature_matrix, na.rm = TRUE)
+feature_sds <- apply(feature_matrix, 2, sd, na.rm = TRUE)
+feature_sds[feature_sds == 0] <- 1
+
+scaled_features <- scale(feature_matrix, center = feature_means, scale = feature_sds)
+
+# Scale target
+target_values <- feature_data$AnnualShoalingRate_ftperyr
+target_mean <- mean(target_values, na.rm = TRUE)
+target_sd <- sd(target_values, na.rm = TRUE)
+scaled_target <- (target_values - target_mean) / target_sd
+
+dates <- feature_data$SurveyDateBefore
+
+# Create sequences
+n_samples <- nrow(scaled_features) - sequence_length - forecast_horizon + 1
+n_features <- ncol(scaled_features)
+
+if (n_samples < 10) {
+  cat("WARNING: Too few sequences can be created\n")
+  return(NULL)
+}
+
+X <- array(0, dim = c(n_samples, sequence_length, n_features))
+y <- matrix(0, nrow = n_samples, ncol = forecast_horizon)
+sample_dates <- character(n_samples)
+
+for (i in 1:n_samples) {
+  X[i, , ] <- scaled_features[i:(i + sequence_length - 1), ]
+  y[i, ] <- scaled_target[(i + sequence_length):(i + sequence_length + forecast_horizon - 1)]
+  sample_dates[i] <- as.character(dates[i + sequence_length + forecast_horizon - 1])
+}
+
+cat(sprintf("Sequences created: %d\n", n_samples))
+cat(sprintf("Input shape: [%d, %d, %d]\n", n_samples, sequence_length, n_features))
+cat(sprintf("Output shape: [%d, %d]\n", n_samples, forecast_horizon))
+
+# Temporal split
+train_size <- floor(n_samples * 0.70)
+val_size <- floor(n_samples * 0.15)
+
+lstm_data <- list(
+  X_train = X[1:train_size, , , drop = FALSE],
+  y_train = y[1:train_size, , drop = FALSE],
+  X_val = X[(train_size + 1):(train_size + val_size), , , drop = FALSE],
+  y_val = y[(train_size + 1):(train_size + val_size), , drop = FALSE],
+  X_test = X[(train_size + val_size + 1):n_samples, , , drop = FALSE],
+  y_test = y[(train_size + val_size + 1):n_samples, , drop = FALSE],
+  dates_train = sample_dates[1:train_size],
+  dates_val = sample_dates[(train_size + 1):(train_size + val_size)],
+  dates_test = sample_dates[(train_size + val_size + 1):n_samples],
+  feature_means = feature_means,
+  feature_sds = feature_sds,
+  target_mean = target_mean,
+  target_sd = target_sd,
+  sequence_length = sequence_length,
+  forecast_horizon = forecast_horizon,
+  n_features = n_features,
+  feature_names = feature_cols,
+  dataset_name = dataset_name,
+  n_train = train_size,
+  n_val = val_size,
+  n_test = n_samples - train_size - val_size
+)
+
+cat(sprintf("Split sizes: Train=%d, Val=%d, Test=%d\n",
+            lstm_data$n_train, lstm_data$n_val, lstm_data$n_test))
+
+return(lstm_data)
+}
+```
+
+```{r lstm-model-function}
+# Build LSTM model with batch normalization
+build_lstm_model_improved <- function(sequence_length, n_features, forecast_horizon) {
+
+  
+  model <- keras_model_sequential() |>
+    # First LSTM - reduced dropout
+    layer_lstm(
+      units = 64,
+      return_sequences = TRUE,
+      input_shape = c(sequence_length, n_features),
+      dropout = 0.1,           
+      recurrent_dropout = 0.05  
+    ) |>
+    layer_batch_normalization() |>
+    
+    # Second LSTM
+    layer_lstm(
+      units = 32,
+      return_sequences = FALSE,
+      dropout = 0.1,
+      recurrent_dropout = 0.05
+    ) |>
+    
+    # Simpler dense layers
+    layer_dense(units = 32, activation = "relu") |>
+    layer_dense(units = forecast_horizon, activation = "linear")
+  
+  # Higher learning rate initially
+  model |> compile(
+    optimizer = optimizer_adam(learning_rate = 0.002),
+    loss = "mse",
+    metrics = c("mae")
+  )
+  
+  return(model)
+}
+```
+
+## Build LSTM Training Function
+```{r lstm train function}
+train_lstm_model <- function(lstm_data, dataset_name,
+                            epochs = 100, batch_size = 32, patience = 20, threshold) {
+
+if (is.null(lstm_data)) {
+  cat(sprintf("Skipping %s - no data prepared\n", dataset_name))
+  return(NULL)
+}
+
+cat(sprintf("\n=== Training LSTM: %s ===\n", dataset_name))
+
+# Build model
+model <- build_lstm_model(
+  sequence_length = lstm_data$sequence_length,
+  n_features = lstm_data$n_features,
+  forecast_horizon = lstm_data$forecast_horizon
+)
+
+
+# Callbacks
+callbacks <- list(
+  callback_early_stopping(
+    monitor = 'val_loss',
+    patience = patience,
+    restore_best_weights = TRUE,
+    verbose = 1
+  ),
+  callback_reduce_lr_on_plateau(
+    monitor = 'val_loss',
+    factor = 0.5,
+    patience = 10,
+    min_lr = 1e-6,
+    verbose = 1
+  )
+)
+
+# Train
+cat("Training model...\n")
+start_time <- Sys.time()
+
+history <- model |> fit(
+  x = lstm_data$X_train,
+  y = lstm_data$y_train,
+  validation_data = list(lstm_data$X_val, lstm_data$y_val),
+  epochs = epochs,
+  batch_size = batch_size,
+  callbacks = callbacks,
+  verbose = 1
+)
+
+training_time <- difftime(Sys.time(), start_time, units = "mins")
+cat(sprintf("Training completed in %.1f minutes\n", training_time))
+
+# Predictions and inverse transform
+test_pred_scaled <- predict(model, lstm_data$X_test)
+test_pred <- test_pred_scaled * lstm_data$target_sd + lstm_data$target_mean
+test_actual <- lstm_data$y_test * lstm_data$target_sd + lstm_data$target_mean
+
+# Calculate metrics
+rmse_all <- sqrt(mean((test_pred - test_actual)^2))
+mae_all <- mean(abs(test_pred - test_actual))
+rmse_1step <- sqrt(mean((test_pred[, 1] - test_actual[, 1])^2))
+mae_1step <- mean(abs(test_pred[, 1] - test_actual[, 1]))
+
+# Horizon-specific metrics
+horizon_metrics <- data.frame(
+  Horizon = 1:lstm_data$forecast_horizon,
+  RMSE = sapply(1:lstm_data$forecast_horizon, function(h) {
+    sqrt(mean((test_pred[, h] - test_actual[, h])^2))
+  }),
+  MAE = sapply(1:lstm_data$forecast_horizon, function(h) {
+    mean(abs(test_pred[, h] - test_actual[, h]))
+  })
+)
+
+cat(sprintf("\nTest Performance:\n"))
+cat(sprintf("  All horizons - RMSE: %.4f, MAE: %.4f\n", rmse_all, mae_all))
+cat(sprintf("  1-step ahead - RMSE: %.4f, MAE: %.4f\n", rmse_1step, mae_1step))
+
+# Classification metrics (1-step)
+class_metrics <- calculate_classification_metrics(test_actual[, 1], test_pred[, 1],
+                                                  threshold)
+
+cat(sprintf("  Classification - Accuracy: %.1f%%, F1: %.3f\n",
+            class_metrics$accuracy * 100, class_metrics$f1))
+
+return(list(
+  model = model,
+  history = history,
+  dataset_name = dataset_name,
+  training_time = training_time,
+  metrics = data.frame(
+    Dataset = dataset_name,
+    Model = "LSTM",
+    Test_RMSE_All = rmse_all,
+    Test_MAE_All = mae_all,
+    Test_RMSE_1Step = rmse_1step,
+    Test_MAE_1Step = mae_1step,
+    Accuracy = class_metrics$accuracy,
+    Precision = class_metrics$precision,
+    Recall = class_metrics$recall,
+    F1_Score = class_metrics$f1,
+    Forecast_Horizon = lstm_data$forecast_horizon
+  ),
+  horizon_metrics = horizon_metrics,
+  predictions = list(
+    actual = test_actual,
+    predicted = test_pred,
+    actual_1step = test_actual[, 1],
+    predicted_1step = test_pred[, 1],
+    dates = lstm_data$dates_test
+  ),
+  confusion = class_metrics$confusion,
+  scalers = list(target_mean = lstm_data$target_mean, target_sd = lstm_data$target_sd)
+))
+}
+```
+
+## Train River-level LSTM Models
+```{r train-lstm-river}
+# Prepare data
+IWW_lstm_data <- prepare_lstm_data_fixed(
+IWW_data, IWW_gages,
+sequence_length = 20, forecast_horizon = 45,
+dataset_name = "Illinois Waterway"
+)
+
+Miss_lstm_data <- prepare_lstm_data_fixed(
+Miss_data, Miss_gages,
+sequence_length = 30, forecast_horizon = 45,
+dataset_name = "Mississippi River"
+)
+
+Combined_lstm_data <- prepare_lstm_data_fixed(
+gage_CSAT_joined, All_gages,
+sequence_length = 25, forecast_horizon = 45,
+dataset_name = "Combined"
+)
+
+# Train models
+IWW_lstm <- train_lstm_model(IWW_lstm_data, "Illinois Waterway", threshold = IWW_thresh)
+Miss_lstm <- train_lstm_model(Miss_lstm_data, "Mississippi River", threshold = Miss_thresh)
+Combined_lstm <- train_lstm_model(Combined_lstm_data, "Combined", threshold = comb_thresh)
+```
+
+## Build Pool-Level LSTM Models
+```{r lstm-pool-function}
+train_pool_lstm <- function(data, pool_name, river_code,
+                           pool_gage_mapping,
+                           sequence_length = 15,
+                           forecast_horizon = 30,
+                           min_samples = 150, threshold) {
+
+key <- paste(river_code, pool_name, sep = "_")
+
+if (!key %in% names(pool_gage_mapping)) {
+  return(list(pool = pool_name, river = river_code, status = "no_mapping", metrics = NULL))
+}
+
+pool_map <- pool_gage_mapping[[key]]
+river_filter <- pool_map$river_filter
+selected_gages <- pool_map$selected_gages
+
+pool_data <- data |>
+  filter(pool == pool_name, river == river_filter) |>
+  arrange(SurveyDateBefore)
+
+min_required <- sequence_length + forecast_horizon + 50
+
+if (nrow(pool_data) < max(min_samples, min_required)) {
+  return(list(pool = pool_name, river = river_code, status = "insufficient_samples",
+              n = nrow(pool_data), metrics = NULL))
+}
+
+cat(sprintf("\n--- LSTM Pool %s (%s): %d samples ---\n", pool_name, river_code, nrow(pool_data)))
+
+lstm_data <- prepare_lstm_data_fixed(
+  data = pool_data,
+  gages_to_use = selected_gages,
+  sequence_length = sequence_length,
+  forecast_horizon = forecast_horizon,
+  dataset_name = paste("Pool", pool_name)
+)
+
+if (is.null(lstm_data)) {
+  return(list(pool = pool_name, river = river_code, status = "data_prep_failed", metrics = NULL))
+}
+
+
+lstm_result <- tryCatch({
+  train_lstm_model(
+    lstm_data = lstm_data,
+    dataset_name = paste("Pool", pool_name),
+    epochs = 75,
+    batch_size = min(32, floor(lstm_data$n_train / 4)),
+    patience = 15, threshold = threshold
+  )
+}, error = function(e) {
+  cat(sprintf("  LSTM training error: %s\n", e$message))
+  return(NULL)
+})
+
+if (is.null(lstm_result)) {
+  return(list(pool = pool_name, river = river_code, status = "training_failed", metrics = NULL))
+}
+
+lstm_result$metrics <- lstm_result$metrics |>
+  mutate(Pool = pool_name, River = river_code, N_Samples = nrow(pool_data))
+
+lstm_result$pool <- pool_name
+lstm_result$river <- river_code
+lstm_result$status <- "success"
+lstm_result$n_samples <- nrow(pool_data)
+
+return(lstm_result)
+}
+```
+
+##Train Pool-Level LSTM Models
+```{r train-lstm-pool}
+# Train LSTM for pools with sufficient data (>= 150 samples)
+lstm_viable_pools <- viable_pools |>
+filter(n_samples >= 150)
+
+cat(sprintf("Training pool-level LSTM for %d viable pools\n", nrow(lstm_viable_pools)))
+
+pool_lstm_results <- list()
+
+for (i in 1:nrow(lstm_viable_pools)) {
+pool_name <- lstm_viable_pools$pool[i]
+river_code <- lstm_viable_pools$river[i]
+
+pool_threshold <- pool_thresholds |>
+  filter(pool == pool_name) |>
+  pull(mean_rate)
+
+result <- train_pool_lstm(
+  data = gage_CSAT_joined,
+  pool_name = pool_name,
+  river_code = river_code,
+  pool_gage_mapping = pool_gage_mapping,
+  sequence_length = 15,
+  forecast_horizon = 30,
+  min_samples = 150,
+  threshold = pool_threshold
+)
+
+key <- paste(river_code, pool_name, sep = "_")
+pool_lstm_results[[key]] <- result
+}
+
+# Compile results
+pool_lstm_metrics <- do.call(rbind, lapply(pool_lstm_results, function(x) {
+if (!is.null(x$metrics)) x$metrics else NULL
+}))
+
+cat("\n=== Pool LSTM Results Summary ===\n")
+if (!is.null(pool_lstm_metrics)) {
+print(pool_lstm_metrics |> select(Pool, River, Test_RMSE_1Step, Accuracy, F1_Score))
+}
+```
+
+# Compile Model Results 
+```{r compile-results}
+# River-level regression results
+river_results <- bind_rows(
+IWW_baselines$results |> mutate(River = "Illinois Waterway", Type = "Baseline"),
+Miss_baselines$results |> mutate(River = "Mississippi River", Type = "Baseline"),
+Combined_baselines$results |> mutate(River = "Combined", Type = "Baseline"),
+IWW_xgb$metrics |>
+  select(Dataset, Model, Test_RMSE, Test_MAE) |>
+  mutate(River = "Illinois Waterway", Type = "ML"),
+Miss_xgb$metrics |>
+  select(Dataset, Model, Test_RMSE, Test_MAE) |>
+  mutate(River = "Mississippi River", Type = "ML"),
+Combined_xgb$metrics |>
+  select(Dataset, Model, Test_RMSE, Test_MAE) |>
+  mutate(River = "Combined", Type = "ML")
+)
+
+# Add LSTM results
+if (!is.null(IWW_lstm)) {
+river_results <- bind_rows(
+  river_results,
+  IWW_lstm$metrics |>
+    mutate(Model = "LSTM", Test_RMSE = Test_RMSE_1Step, Test_MAE = Test_MAE_1Step,
+           River = "Illinois Waterway", Type = "ML") |>
+    select(Dataset, Model, Test_RMSE, Test_MAE, River, Type)
+)
+}
+
+if (!is.null(Miss_lstm)) {
+river_results <- bind_rows(
+  river_results,
+  Miss_lstm$metrics |>
+    mutate(Model = "LSTM", Test_RMSE = Test_RMSE_1Step, Test_MAE = Test_MAE_1Step,
+           River = "Mississippi River", Type = "ML") |>
+    select(Dataset, Model, Test_RMSE, Test_MAE, River, Type)
+)
+}
+
+if (!is.null(Combined_lstm)) {
+river_results <- bind_rows(
+  river_results,
+  Combined_lstm$metrics |>
+    mutate(Model = "LSTM", Test_RMSE = Test_RMSE_1Step, Test_MAE = Test_MAE_1Step,
+           River = "Combined", Type = "ML") |>
+    select(Dataset, Model, Test_RMSE, Test_MAE, River, Type)
+)
+}
+
+# Classification results
+classification_results <- bind_rows(
+IWW_xgb$metrics |> select(Dataset, Accuracy, Precision, Recall, F1_Score) |> mutate(Model = "xGBoost"),
+Miss_xgb$metrics |> select(Dataset, Accuracy, Precision, Recall, F1_Score) |> mutate(Model = "xGBoost"),
+Combined_xgb$metrics |> select(Dataset, Accuracy, Precision, Recall, F1_Score) |> mutate(Model = "xGBoost")
+)
+
+if (!is.null(IWW_lstm)) {
+classification_results <- bind_rows(
+  classification_results,
+  IWW_lstm$metrics |> select(Dataset, Accuracy, Precision, Recall, F1_Score) |> mutate(Model = "LSTM")
+)
+}
+
+if (!is.null(Miss_lstm)) {
+classification_results <- bind_rows(
+  classification_results,
+  Miss_lstm$metrics |> select(Dataset, Accuracy, Precision, Recall, F1_Score) |> mutate(Model = "LSTM")
+)
+}
+
+if (!is.null(Combined_lstm)) {
+classification_results <- bind_rows(
+  classification_results,
+  Combined_lstm$metrics |> select(Dataset, Accuracy, Precision, Recall, F1_Score) |> mutate(Model = "LSTM")
+)
+}
+
+cat("=== River-Level Regression Results ===\n")
+print(river_results |> arrange(River, Test_RMSE))
+
+cat("\n=== Classification Results ===\n")
+print(classification_results |> arrange(Dataset, desc(F1_Score)))
+```
+
+# Model Performance Summary
+```{r performance-summary}
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════════════╗\n")
+cat("║                    COMPREHENSIVE RESULTS SUMMARY                        ║\n")
+cat("╠════════════════════════════════════════════════════════════════════════╣\n")
+
+for (river in c("Illinois Waterway", "Mississippi River", "Combined")) {
+
+cat(sprintf("║ %s:\n", river))
+
+river_data <- river_results |>
+  filter(River == river) |>
+  arrange(Test_RMSE)
+
+best_baseline <- river_data |> filter(Type == "Baseline") |> dplyr::slice(1)
+best_ml <- river_data |> filter(Type == "ML") |> dplyr::slice(1)
+
+if (nrow(best_ml) > 0) {
+  improvement <- (best_baseline$Test_RMSE - best_ml$Test_RMSE) / best_baseline$Test_RMSE * 100
+  
+  cat(sprintf("║   Best Baseline: %s (RMSE: %.4f)\n", best_baseline$Model, best_baseline$Test_RMSE))
+  cat(sprintf("║   Best ML Model: %s (RMSE: %.4f)\n", best_ml$Model, best_ml$Test_RMSE))
+  cat(sprintf("║   Improvement: %.1f%%\n", improvement))
+}
+
+cat("║\n")
+}
+
+cat("╚════════════════════════════════════════════════════════════════════════╝\n")
+```
+#Pool Level Results
+```{r}
+# ============================================================================
+# POOL-LEVEL MODEL RESULTS AND COMPARISONS
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. POOL XGBOOST SUMMARY
+# ----------------------------------------------------------------------------
+
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════════════╗\n")
+cat("║                    POOL-LEVEL XGBOOST RESULTS                          ║\n")
+cat("╚════════════════════════════════════════════════════════════════════════╝\n\n")
+
+if (!is.null(pool_xgb_metrics) && nrow(pool_xgb_metrics) > 0) {
+  
+  # Summary statistics by river
+  pool_xgb_summary <- pool_xgb_metrics |>
+    group_by(River) |>
+    summarise(
+      N_Pools = n(),
+      Avg_RMSE = round(mean(Test_RMSE, na.rm = TRUE), 3),
+      Min_RMSE = round(min(Test_RMSE, na.rm = TRUE), 3),
+      Max_RMSE = round(max(Test_RMSE, na.rm = TRUE), 3),
+      Avg_R2 = round(mean(Test_R2, na.rm = TRUE), 3),
+      Avg_Accuracy = round(mean(Accuracy, na.rm = TRUE) * 100, 1),
+      Avg_F1 = round(mean(F1_Score, na.rm = TRUE), 3),
+      .groups = "drop"
+    )
+  
+  cat("=== Summary by River System ===\n")
+  print(pool_xgb_summary)
+  
+  # Best performing pools
+  cat("\n=== Top 5 Best Performing Pools (by RMSE) ===\n")
+  best_pools <- pool_xgb_metrics |>
+    arrange(Test_RMSE) |>
+    head(5) |>
+    select(Pool, River, N_Samples, Test_RMSE, Test_R2, Accuracy, F1_Score) |>
+    mutate(
+      Test_RMSE = round(Test_RMSE, 3),
+      Test_R2 = round(Test_R2, 3),
+      Accuracy = round(Accuracy * 100, 1),
+      F1_Score = round(F1_Score, 3)
+    )
+  print(best_pools)
+  
+  # Worst performing pools
+  cat("\n=== Top 5 Worst Performing Pools (by RMSE) ===\n")
+  worst_pools <- pool_xgb_metrics |>
+    arrange(desc(Test_RMSE)) |>
+    head(5) |>
+    select(Pool, River, N_Samples, Test_RMSE, Test_R2, Accuracy, F1_Score) |>
+    mutate(
+      Test_RMSE = round(Test_RMSE, 3),
+      Test_R2 = round(Test_R2, 3),
+      Accuracy = round(Accuracy * 100, 1),
+      F1_Score = round(F1_Score, 3)
+    )
+  print(worst_pools)
+  
+  # Classification performance
+  cat("\n=== Classification Performance by Pool ===\n")
+  class_summary <- pool_xgb_metrics |>
+    arrange(desc(F1_Score)) |>
+    select(Pool, River, Accuracy, Precision, Recall, F1_Score) |>
+    mutate(
+      Accuracy = round(Accuracy * 100, 1),
+      Precision = round(Precision, 3),
+      Recall = round(Recall, 3),
+      F1_Score = round(F1_Score, 3)
+    )
+  print(class_summary)
+  
+} else {
+  cat("No pool-level xGBoost results available\n")
+}
+
+# ----------------------------------------------------------------------------
+# 2. POOL LSTM SUMMARY (if available)
+# ----------------------------------------------------------------------------
+
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════════════╗\n")
+cat("║                    POOL-LEVEL LSTM RESULTS                             ║\n")
+cat("╚════════════════════════════════════════════════════════════════════════╝\n\n")
+
+if (!is.null(pool_lstm_metrics) && nrow(pool_lstm_metrics) > 0) {
+  
+  pool_lstm_summary <- pool_lstm_metrics |>
+    group_by(River) |>
+    summarise(
+      N_Pools = n(),
+      Avg_RMSE_1Step = round(mean(Test_RMSE_1Step, na.rm = TRUE), 3),
+      Min_RMSE_1Step = round(min(Test_RMSE_1Step, na.rm = TRUE), 3),
+      Max_RMSE_1Step = round(max(Test_RMSE_1Step, na.rm = TRUE), 3),
+      Avg_Accuracy = round(mean(Accuracy, na.rm = TRUE) * 100, 1),
+      Avg_F1 = round(mean(F1_Score, na.rm = TRUE), 3),
+      .groups = "drop"
+    )
+  
+  cat("=== LSTM Summary by River System ===\n")
+  print(pool_lstm_summary)
+  
+  cat("\n=== Pool LSTM Detailed Results ===\n")
+  print(pool_lstm_metrics |> 
+          select(Pool, River, Test_RMSE_1Step, Accuracy, F1_Score) |>
+          mutate(
+            Test_RMSE_1Step = round(Test_RMSE_1Step, 3),
+            Accuracy = round(Accuracy * 100, 1),
+            F1_Score = round(F1_Score, 3)
+          ) |>
+          arrange(Test_RMSE_1Step))
+  
+} else {
+  cat("No pool-level LSTM results available (requires >= 150 samples per pool)\n")
+}
+
+# ----------------------------------------------------------------------------
+# 3. POOL vs RIVER-LEVEL COMPARISON
+# ----------------------------------------------------------------------------
+
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════════════╗\n")
+cat("║                 POOL-LEVEL vs RIVER-LEVEL COMPARISON                   ║\n")
+cat("╚════════════════════════════════════════════════════════════════════════╝\n\n")
+
+# Create comparison table
+comparison_data <- data.frame(
+  Level = c("River-Level", "River-Level", "Pool-Level Avg", "Pool-Level Avg"),
+  River = c("Illinois Waterway", "Mississippi River", "Illinois Waterway", "Mississippi River"),
+  Model = rep("xGBoost", 4),
+  RMSE = c(
+    IWW_xgb$metrics$Test_RMSE,
+    Miss_xgb$metrics$Test_RMSE,
+    ifelse(!is.null(pool_xgb_metrics), 
+           mean(pool_xgb_metrics$Test_RMSE[pool_xgb_metrics$River == "IL"], na.rm = TRUE), 
+           NA),
+    ifelse(!is.null(pool_xgb_metrics), 
+           mean(pool_xgb_metrics$Test_RMSE[pool_xgb_metrics$River == "UM"], na.rm = TRUE), 
+           NA)
+  ),
+  Accuracy = c(
+    IWW_xgb$metrics$Accuracy,
+    Miss_xgb$metrics$Accuracy,
+    ifelse(!is.null(pool_xgb_metrics), 
+           mean(pool_xgb_metrics$Accuracy[pool_xgb_metrics$River == "IL"], na.rm = TRUE), 
+           NA),
+    ifelse(!is.null(pool_xgb_metrics), 
+           mean(pool_xgb_metrics$Accuracy[pool_xgb_metrics$River == "UM"], na.rm = TRUE), 
+           NA)
+  )
+) |>
+  mutate(
+    RMSE = round(RMSE, 3),
+    Accuracy = round(Accuracy * 100, 1)
+  )
+
+cat("=== xGBoost: River-Level vs Pool-Level ===\n")
+print(comparison_data)
+
+# Calculate if pool-level is better or worse
+if (!is.null(pool_xgb_metrics)) {
+  cat("\n=== Performance Difference (Pool - River) ===\n")
+  
+  iww_diff <- mean(pool_xgb_metrics$Test_RMSE[pool_xgb_metrics$River == "IL"], na.rm = TRUE) - 
+              IWW_xgb$metrics$Test_RMSE
+  miss_diff <- mean(pool_xgb_metrics$Test_RMSE[pool_xgb_metrics$River == "UM"], na.rm = TRUE) - 
+               Miss_xgb$metrics$Test_RMSE
+  
+  cat(sprintf("  Illinois Waterway: %+.3f RMSE (%s)\n", 
+              iww_diff, 
+              ifelse(iww_diff < 0, "Pool-level BETTER", "River-level BETTER")))
+  cat(sprintf("  Mississippi River: %+.3f RMSE (%s)\n", 
+              miss_diff, 
+              ifelse(miss_diff < 0, "Pool-level BETTER", "River-level BETTER")))
+}
+
+# ----------------------------------------------------------------------------
+# 4. VISUALIZATIONS
+# ----------------------------------------------------------------------------
+
+# Plot 1: Pool RMSE Distribution by River
+if (!is.null(pool_xgb_metrics) && nrow(pool_xgb_metrics) > 0) {
+  
+  p_pool_rmse <- pool_xgb_metrics |>
+    mutate(river_label = ifelse(River == "IL", "Illinois Waterway", "Mississippi River")) |>
+    ggplot(aes(x = reorder(Pool, Test_RMSE), y = Test_RMSE, fill = river_label)) +
+    geom_col(alpha = 0.8) +
+    geom_hline(data = data.frame(
+      river_label = c("Illinois Waterway", "Mississippi River"),
+      yint = c(IWW_xgb$metrics$Test_RMSE, Miss_xgb$metrics$Test_RMSE)
+    ), aes(yintercept = yint), linetype = "dashed", color = "red", linewidth = 1) +
+    facet_wrap(~river_label, scales = "free_x") +
+    scale_fill_manual(values = c("Illinois Waterway" = "orange", "Mississippi River" = "dodgerblue")) +
+    labs(
+      title = "Pool-Level xGBoost RMSE Performance",
+      subtitle = "Dashed line = River-level model RMSE",
+      x = "Pool",
+      y = "Test RMSE (ft/yr)",
+      fill = "River"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "none"
+    )
+  
+  print(p_pool_rmse)
+  ggsave("./Output/Pool_Models/Pool_RMSE_Comparison.png", width = 14, height = 8)
+  
+  # Plot 2: Pool Classification Accuracy
+  p_pool_accuracy <- pool_xgb_metrics |>
+    mutate(river_label = ifelse(River == "IL", "Illinois Waterway", "Mississippi River")) |>
+    ggplot(aes(x = reorder(Pool, Accuracy), y = Accuracy * 100, fill = river_label)) +
+    geom_col(alpha = 0.8) +
+    geom_hline(yintercept = 50, linetype = "dashed", color = "gray50") +
+    facet_wrap(~river_label, scales = "free_x") +
+    scale_fill_manual(values = c("Illinois Waterway" = "orange", "Mississippi River" = "dodgerblue")) +
+    labs(
+      title = "Pool-Level Classification Accuracy",
+      subtitle = "Dashed line = 50% (random baseline)",
+      x = "Pool",
+      y = "Accuracy (%)",
+      fill = "River"
+    ) +
+    theme_minimal() +
+    theme(
+      axis.text.x = element_text(angle = 45, hjust = 1),
+      legend.position = "none"
+    )
+  
+  print(p_pool_accuracy)
+  ggsave("./Output/Pool_Models/Pool_Accuracy_Comparison.png", width = 14, height = 8)
+  
+  # Plot 3: Sample Size vs Performance
+  p_samples_vs_rmse <- pool_xgb_metrics |>
+    mutate(river_label = ifelse(River == "IL", "Illinois Waterway", "Mississippi River")) |>
+    ggplot(aes(x = N_Samples, y = Test_RMSE, color = river_label)) +
+    geom_point(size = 4, alpha = 0.7) +
+    geom_text(aes(label = Pool), hjust = -0.2, vjust = 0.5, size = 3) +
+    geom_smooth(method = "lm", se = TRUE, alpha = 0.2) +
+    scale_color_manual(values = c("Illinois Waterway" = "orange", "Mississippi River" = "dodgerblue")) +
+    labs(
+      title = "Sample Size vs Model Performance",
+      subtitle = "Does more data improve predictions?",
+      x = "Number of Training Samples",
+      y = "Test RMSE (ft/yr)",
+      color = "River"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p_samples_vs_rmse)
+  ggsave("./Output/Pool_Models/Samples_vs_RMSE.png", width = 12, height = 8)
+  
+  # Plot 4: RMSE vs R² Scatter
+  p_rmse_r2 <- pool_xgb_metrics |>
+    mutate(river_label = ifelse(River == "IL", "Illinois Waterway", "Mississippi River")) |>
+    ggplot(aes(x = Test_RMSE, y = Test_R2, color = river_label, size = N_Samples)) +
+    geom_point(alpha = 0.7) +
+    geom_text(aes(label = Pool), hjust = -0.2, vjust = 0.5, size = 3) +
+    scale_color_manual(values = c("Illinois Waterway" = "orange", "Mississippi River" = "dodgerblue")) +
+    scale_size_continuous(range = c(3, 10)) +
+    labs(
+      title = "Pool Model Performance: RMSE vs R²",
+      x = "Test RMSE (ft/yr)",
+      y = "R²",
+      color = "River",
+      size = "N Samples"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "right")
+  
+  print(p_rmse_r2)
+  ggsave("./Output/Pool_Models/RMSE_vs_R2.png", width = 12, height = 8)
+}
+
+# ----------------------------------------------------------------------------
+# 5. COMPREHENSIVE RESULTS TABLE
+# ----------------------------------------------------------------------------
+
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════════════╗\n")
+cat("║                 COMPREHENSIVE POOL RESULTS TABLE                       ║\n")
+cat("╚════════════════════════════════════════════════════════════════════════╝\n\n")
+
+if (!is.null(pool_xgb_metrics)) {
+  
+  comprehensive_pool_results <- pool_xgb_metrics |>
+    mutate(
+      river_label = ifelse(River == "IL", "Illinois Waterway", "Mississippi River")
+    ) |>
+    select(
+      Pool, 
+      River = river_label,
+      N_Samples,
+      N_Gages,
+      RMSE = Test_RMSE,
+      MAE = Test_MAE,
+      R2 = Test_R2,
+      Accuracy,
+      Precision,
+      Recall,
+      F1 = F1_Score
+    ) |>
+    mutate(
+      RMSE = round(RMSE, 3),
+      MAE = round(MAE, 3),
+      R2 = round(R2, 3),
+      Accuracy = round(Accuracy * 100, 1),
+      Precision = round(Precision, 3),
+      Recall = round(Recall, 3),
+      F1 = round(F1, 3)
+    ) |>
+    arrange(River, RMSE)
+  
+  print(comprehensive_pool_results)
+  
+  # Save to CSV
+  write_csv(comprehensive_pool_results, "./Output/Pool_Models/Comprehensive_Pool_Results.csv")
+  cat("\nResults saved to ./Output/Pool_Models/Comprehensive_Pool_Results.csv\n")
+}
+
+# ----------------------------------------------------------------------------
+# 6. STATISTICAL TESTS
+# ----------------------------------------------------------------------------
+
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════════════╗\n")
+cat("║                    STATISTICAL COMPARISONS                             ║\n")
+cat("╚════════════════════════════════════════════════════════════════════════╝\n\n")
+
+if (!is.null(pool_xgb_metrics) && nrow(pool_xgb_metrics) > 1) {
+  
+  # Test if IWW and Miss pools have different RMSE
+  iww_rmse <- pool_xgb_metrics$Test_RMSE[pool_xgb_metrics$River == "IL"]
+  miss_rmse <- pool_xgb_metrics$Test_RMSE[pool_xgb_metrics$River == "UM"]
+  
+  if (length(iww_rmse) >= 2 && length(miss_rmse) >= 2) {
+    t_test <- t.test(iww_rmse, miss_rmse)
+    
+    cat("=== T-Test: IWW vs Mississippi Pool RMSE ===\n")
+    cat(sprintf("  IWW Mean RMSE: %.3f (n=%d)\n", mean(iww_rmse), length(iww_rmse)))
+    cat(sprintf("  Miss Mean RMSE: %.3f (n=%d)\n", mean(miss_rmse), length(miss_rmse)))
+    cat(sprintf("  T-statistic: %.3f\n", t_test$statistic))
+    cat(sprintf("  P-value: %.4f\n", t_test$p.value))
+    cat(sprintf("  Significant difference (p<0.05): %s\n", 
+                ifelse(t_test$p.value < 0.05, "YES", "NO")))
+  }
+  
+  # Correlation: Sample size vs RMSE
+  cor_test <- cor.test(pool_xgb_metrics$N_Samples, pool_xgb_metrics$Test_RMSE)
+  
+  cat("\n=== Correlation: Sample Size vs RMSE ===\n")
+  cat(sprintf("  Correlation: %.3f\n", cor_test$estimate))
+  cat(sprintf("  P-value: %.4f\n", cor_test$p.value))
+  cat(sprintf("  Interpretation: %s\n", 
+              ifelse(cor_test$estimate < 0, 
+                     "More samples → Lower RMSE (better)", 
+                     "More samples → Higher RMSE (unexpected)")))
+}
+
+# ----------------------------------------------------------------------------
+# 7. KEY FINDINGS SUMMARY
+# ----------------------------------------------------------------------------
+
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════════════╗\n")
+cat("║                       KEY FINDINGS SUMMARY                             ║\n")
+cat("╚════════════════════════════════════════════════════════════════════════╝\n\n")
+
+if (!is.null(pool_xgb_metrics)) {
+  
+  # Best overall pool
+  best_pool <- pool_xgb_metrics |> slice_min(Test_RMSE, n = 1)
+  worst_pool <- pool_xgb_metrics |> slice_max(Test_RMSE, n = 1)
+  best_class_pool <- pool_xgb_metrics |> slice_max(F1_Score, n = 1)
+  
+  cat(sprintf("1. BEST REGRESSION POOL: %s (%s)\n", best_pool$Pool, 
+              ifelse(best_pool$River == "IL", "Illinois Waterway", "Mississippi River")))
+  cat(sprintf("   - RMSE: %.3f ft/yr, R²: %.3f\n", best_pool$Test_RMSE, best_pool$Test_R2))
+  
+  cat(sprintf("\n2. WORST REGRESSION POOL: %s (%s)\n", worst_pool$Pool,
+              ifelse(worst_pool$River == "IL", "Illinois Waterway", "Mississippi River")))
+  cat(sprintf("   - RMSE: %.3f ft/yr, R²: %.3f\n", worst_pool$Test_RMSE, worst_pool$Test_R2))
+  
+  cat(sprintf("\n3. BEST CLASSIFICATION POOL: %s (%s)\n", best_class_pool$Pool,
+              ifelse(best_class_pool$River == "IL", "Illinois Waterway", "Mississippi River")))
+  cat(sprintf("   - Accuracy: %.1f%%, F1: %.3f\n", best_class_pool$Accuracy * 100, best_class_pool$F1_Score))
+  
+  # River comparison
+  iww_avg_rmse <- mean(pool_xgb_metrics$Test_RMSE[pool_xgb_metrics$River == "IL"], na.rm = TRUE)
+  miss_avg_rmse <- mean(pool_xgb_metrics$Test_RMSE[pool_xgb_metrics$River == "UM"], na.rm = TRUE)
+  
+  cat(sprintf("\n4. RIVER COMPARISON:\n"))
+  cat(sprintf("   - Illinois Waterway avg pool RMSE: %.3f ft/yr\n", iww_avg_rmse))
+  cat(sprintf("   - Mississippi River avg pool RMSE: %.3f ft/yr\n", miss_avg_rmse))
+  cat(sprintf("   - %s pools are more predictable on average\n",
+              ifelse(iww_avg_rmse < miss_avg_rmse, "Illinois Waterway", "Mississippi River")))
+  
+  # Pool vs River level
+  cat(sprintf("\n5. POOL vs RIVER-LEVEL:\n"))
+  cat(sprintf("   - %d of %d pools outperform river-level model (IWW)\n",
+              sum(pool_xgb_metrics$Test_RMSE[pool_xgb_metrics$River == "IL"] < IWW_xgb$metrics$Test_RMSE),
+              sum(pool_xgb_metrics$River == "IL")))
+  cat(sprintf("   - %d of %d pools outperform river-level model (Miss)\n",
+              sum(pool_xgb_metrics$Test_RMSE[pool_xgb_metrics$River == "UM"] < Miss_xgb$metrics$Test_RMSE),
+              sum(pool_xgb_metrics$River == "UM")))
+}
+```
+
+
+
+# Visualizations
+
+## Prediction Plots
+
+```{r prediction-plots, fig.height=10}
+# Function to create time series comparison
+plot_predictions <- function(pred_df, dataset_name, model_type) {
+
+plot_data <- pred_df |>
+  select(date, actual, predicted) |>
+  pivot_longer(cols = c(actual, predicted), names_to = "type", values_to = "shoaling_rate") |>
+  mutate(type = factor(type, levels = c("actual", "predicted"), labels = c("Actual", "Predicted")))
+
+ggplot(plot_data, aes(x = date, y = shoaling_rate, color = type)) +
+  geom_line(linewidth = 0.8, alpha = 0.8) +
+  geom_point(size = 1.5, alpha = 0.6) +
+  scale_color_manual(values = c("Actual" = "#2166AC", "Predicted" = "#D6604D")) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+  labs(
+    title = sprintf("%s - %s Model", dataset_name, model_type),
+    x = "Date", y = "Annual Shoaling Rate (ft/yr)", color = ""
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+}
+
+# Function for scatter plot
+plot_scatter <- function(pred_df, dataset_name, model_type) {
+
+rmse <- sqrt(mean((pred_df$predicted - pred_df$actual)^2))
+mae <- mean(abs(pred_df$predicted - pred_df$actual))
+r2 <- cor(pred_df$actual, pred_df$predicted)^2
+
+ggplot(pred_df, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.6, size = 2.5, color = "#4575B4") +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red", linewidth = 1) +
+  geom_smooth(method = "lm", se = TRUE, color = "#D73027", fill = "#D73027", alpha = 0.2) +
+  labs(
+    title = sprintf("%s - %s", dataset_name, model_type),
+    subtitle = sprintf("RMSE: %.3f | MAE: %.3f | R²: %.3f", rmse, mae, r2),
+    x = "Actual (ft/yr)", y = "Predicted (ft/yr)"
+  ) +
+  theme_minimal() +
+  coord_fixed()
+}
+
+# xGBoost plots
+p_iww_ts <- plot_predictions(IWW_xgb$predictions, "Illinois Waterway", "xGBoost")
+p_miss_ts <- plot_predictions(Miss_xgb$predictions, "Mississippi River", "xGBoost")
+
+p_iww_sc <- plot_scatter(IWW_xgb$predictions, "Illinois Waterway", "xGBoost")
+p_miss_sc <- plot_scatter(Miss_xgb$predictions, "Mississippi River", "xGBoost")
+
+(p_iww_ts + p_miss_ts) / (p_iww_sc + p_miss_sc)
+
+ggsave("./Output/Comparisons/xGBoost_Predictions.png", width = 14, height = 12)
+
+# LSTM plots (if available)
+if (!is.null(IWW_lstm) && !is.null(Miss_lstm)) {
+
+IWW_lstm_pred_df <- data.frame(
+  actual = IWW_lstm$predictions$actual_1step,
+  predicted = IWW_lstm$predictions$predicted_1step,
+  date = as.Date(IWW_lstm$predictions$dates)
+)
+
+Miss_lstm_pred_df <- data.frame(
+  actual = Miss_lstm$predictions$actual_1step,
+  predicted = Miss_lstm$predictions$predicted_1step,
+  date = as.Date(Miss_lstm$predictions$dates)
+)
+
+p_iww_lstm_ts <- plot_predictions(IWW_lstm_pred_df, "Illinois Waterway", "LSTM")
+p_miss_lstm_ts <- plot_predictions(Miss_lstm_pred_df, "Mississippi River", "LSTM")
+
+p_iww_lstm_sc <- plot_scatter(IWW_lstm_pred_df, "Illinois Waterway", "LSTM")
+p_miss_lstm_sc <- plot_scatter(Miss_lstm_pred_df, "Mississippi River", "LSTM")
+
+print((p_iww_lstm_ts + p_miss_lstm_ts) / (p_iww_lstm_sc + p_miss_lstm_sc))
+
+ggsave("./Output/Comparisons/LSTM_Predictions.png", width = 14, height = 12)
+}
+```
+
+## LSTM Horizon Analysis
+```{r lstm-horizon-plot, fig.height=6}
+if (!is.null(IWW_lstm) && !is.null(Miss_lstm)) {
+
+horizon_data <- bind_rows(
+  IWW_lstm$horizon_metrics |> mutate(Dataset = "Illinois Waterway"),
+  Miss_lstm$horizon_metrics |> mutate(Dataset = "Mississippi River")
+)
+
+if (!is.null(Combined_lstm)) {
+  horizon_data <- bind_rows(horizon_data,
+    Combined_lstm$horizon_metrics |> mutate(Dataset = "Combined"))
+}
+
+ggplot(horizon_data, aes(x = Horizon, y = RMSE, color = Dataset)) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2) +
+  scale_color_viridis_d() +
+  labs(
+    title = "LSTM Performance by Forecast Horizon",
+    subtitle = "RMSE increases with forecast distance",
+    x = "Forecast Horizon (observations ahead)",
+    y = "RMSE (ft/yr)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+ggsave("./Output/LSTM/Horizon_Performance.png", width = 10, height = 6)
+}
+```
+
+##  Pool Performance Map
+
+```{r pool-map, fig.height=10}
+if (!is.null(pool_xgb_metrics)) {
+pool_info <- pool_info |>
+  mutate(center_rm = (min_rm + max_rm) / 2)|>
+    mutate(
+    x_pos = ifelse(river == "IL", 2, 1)
+  )
+
+
+pool_map_data <- pool_xgb_metrics |>
+  left_join(pool_info |> select(pool, river, center_rm,x_pos),
+            by = c("Pool" = "pool", "River" = "river"))
+
+ggplot(pool_map_data, aes(x = x_pos, y = center_rm)) +
+  geom_line(aes(group = River), color = "lightblue", linewidth = 8, alpha = 0.4) +
+  geom_point(aes(size = N_Samples, color = Test_RMSE), alpha = 0.8) +
+  geom_text(aes(label = Pool), hjust = -0.3, size = 3) +
+  scale_color_viridis_c(option = "plasma", direction = -1, name = "RMSE\n(ft/yr)") +
+  scale_size_continuous(range = c(3, 12), name = "N Samples") +
+  scale_x_continuous(breaks = c(1, 2),
+                    labels = c("Mississippi\nRiver", "Illinois\nWaterway"),
+                    limits = c(0.5, 2.8)) +
+  labs(
+    title = "Pool-Level xGBoost Model Performance",
+    subtitle = "By river mile (upstream = higher values)",
+    y = "River Mile", x = ""
+  ) +
+  theme_minimal() +
+  theme(panel.grid.major.x = element_blank())
+
+ggsave("./Output/Maps/Pool_Performance_Schematic.png", width = 10, height = 12)
+}
+```
+
+# Dredging Priority Map
+```{r}
+create_dredging_prediction_map <- function(pool_xgb_results, 
+                                           pool_info,
+                                           gage_CSAT_joined,
+                                           threshold_df) {
+  
+  # Collect predictions in a list first
+  prediction_list <- list()
+  
+  for (key in names(pool_xgb_results)) {
+    
+    result <- pool_xgb_results[[key]]
+    
+    # Skip if no model or not successful
+    if (is.null(result$model) || result$status != "success") {
+      cat(sprintf("  Skipping %s: status = %s\n", key, result$status))
+      next
+    }
+    
+    pool_name <- result$pool
+    river_code <- result$river
+    gages_used <- result$gages_used
+    
+    # Get most recent data for this pool
+    recent_data <- gage_CSAT_joined |>
+      filter(pool == pool_name, river == river_code) |>
+      arrange(desc(SurveyDateBefore)) |>
+      dplyr::slice(1)
+    
+    if (nrow(recent_data) == 0) {
+      cat(sprintf("  Skipping %s: no data found\n", key))
+      next
+    }
+    
+    # Select only the features the model needs
+    model_features <- c("WeekOfYear", "DaysBetween", gages_used)
+    available_features <- intersect(model_features, names(recent_data))
+    
+    # Create prediction dataset with only required features
+    pred_data <- recent_data |>
+      select(all_of(available_features))
+    
+    # Check for NAs
+    if (any(is.na(pred_data))) {
+      cat(sprintf("  Skipping %s: NA values in features\n", key))
+      next
+    }
+    
+    # Make prediction
+    pred <- tryCatch({
+      p <- predict(result$model, newdata = pred_data)
+      if (length(p) == 0 || is.null(p)) NA else as.numeric(p)
+    }, error = function(e) {
+      cat(sprintf("  Skipping %s: prediction error - %s\n", key, e$message))
+      NA
+    })
+    
+    if (is.na(pred)) next
+    
+    # Get threshold
+    thresh <- threshold_df |>
+      filter(river == river_code) |>
+      pull(mean_rate)
+    
+    if (length(thresh) == 0) thresh <- comb_thresh
+    
+    # Add to list
+    prediction_list[[key]] <- data.frame(
+      Pool = pool_name,
+      River = river_code,
+      Last_Survey = recent_data$SurveyDateBefore,
+      Actual_Rate = recent_data$AnnualShoalingRate_ftperyr,
+      Predicted_Rate = pred,
+      Threshold = thresh,
+      Dredge_Needed = pred > thresh,
+      Urgency = case_when(
+        pred > thresh * 2 ~ "HIGH",
+        pred > thresh ~ "MODERATE", 
+        pred > 0 ~ "LOW",
+        TRUE ~ "NONE"
+      )
+    )
+    
+    cat(sprintf("  Success: %s - Predicted: %.2f\n", key, pred))
+  }
+  
+  # Check if we got any predictions
+  if (length(prediction_list) == 0) {
+    warning("No predictions generated")
+    return(NULL)
+  }
+  
+  # Combine into data frame
+  prediction_data <- do.call(rbind, prediction_list)
+  
+  # Join with pool location info
+  prediction_data <- prediction_data |>
+    left_join(
+      pool_info |> select(pool, river, center_rm, n_samples),
+      by = c("Pool" = "pool", "River" = "river")
+    ) |>
+    mutate(
+      x_pos = ifelse(River == "IL", 2, 1),
+      river_label = ifelse(River == "IL", "Illinois Waterway", "Mississippi River")
+    )
+  
+  return(prediction_data)
+}
+
+# Generate predictions
+cat("Generating dredging predictions...\n")
+dredge_predictions <- create_dredging_prediction_map(
+  pool_xgb_results = pool_xgb_results,
+  pool_info = pool_info,
+  gage_CSAT_joined = gage_CSAT_joined,
+  threshold_df = river_thresholds
+)
+
+# Check results
+if (!is.null(dredge_predictions)) {
+  cat(sprintf("\nGenerated %d predictions\n", nrow(dredge_predictions)))
+  print(dredge_predictions |> select(Pool, River, Predicted_Rate, Urgency))
+} else {
+  cat("\nNo predictions generated - see messages above\n")
+}
+# ============================================================================
+# PLOT: Dredging Need by Pool
+# ============================================================================
+
+if (!is.null(dredge_predictions) && nrow(dredge_predictions) > 0) {
+
+  p_dredge_map <- ggplot(dredge_predictions, aes(x = x_pos, y = center_rm)) +
+    # River lines
+    geom_line(aes(group = River), color = "lightblue", linewidth = 10, alpha = 0.3) +
+    # Pool points - colored by urgency
+    geom_point(aes(size = abs(Predicted_Rate), fill = Urgency), 
+               shape = 21, color = "black", alpha = 0.8) +
+    # Pool labels
+    geom_text(aes(label = Pool), hjust = -0.3, size = 3) +
+    # Color scale for urgency
+    scale_fill_manual(
+      values = c("HIGH" = "#d73027", "MODERATE" = "#fc8d59", 
+                 "LOW" = "#fee090", "NONE" = "#91bfdb"),
+      name = "Dredging\nUrgency"
+    ) +
+    scale_size_continuous(range = c(4, 15), name = "Predicted\nRate (ft/yr)") +
+    scale_x_continuous(
+      breaks = c(1, 2),
+      labels = c("Mississippi\nRiver", "Illinois\nWaterway"),
+      limits = c(0.5, 2.8)
+    ) +
+    labs(
+      title = "Predicted Dredging Needs by Pool",
+      subtitle = paste("Based on most recent survey data | Generated:", Sys.Date()),
+      y = "River Mile",
+      x = ""
+    ) +
+    theme_minimal() +
+    theme(
+      panel.grid.major.x = element_blank(),
+      legend.position = "right"
+    )
+
+  print(p_dredge_map)
+  ggsave("./Output/Maps/Dredging_Predictions_Map.png", width = 12, height = 14)
+
+  # ============================================================================
+  # TABLE: Dredging Priority List
+  # ============================================================================
+
+  dredge_priority <- dredge_predictions |>
+    filter(Dredge_Needed == TRUE) |>
+    arrange(desc(Predicted_Rate)) |>
+    select(Pool, river_label, Predicted_Rate, Threshold, Urgency, Last_Survey) |>
+    mutate(
+      Predicted_Rate = round(Predicted_Rate, 2),
+      Days_Since_Survey = as.numeric(Sys.Date() - Last_Survey)
+    )
+
+  cat("\n=== DREDGING PRIORITY LIST ===\n")
+  print(dredge_priority)
+
+  # Save priority list
+  write_csv(dredge_priority, "./Output/Maps/Dredging_Priority_List.csv")
+
+} else {
+  cat("No dredging predictions available to map\n")
+}
+
+```
+## Dredging Priority Maps LSTM
+```{r}
+# ============================================================================
+# LSTM FORECAST HORIZON ANALYSIS AND VISUALIZATION
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# 1. HORIZON PERFORMANCE SUMMARY
+# ----------------------------------------------------------------------------
+
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════════════╗\n")
+cat("║                 LSTM FORECAST HORIZON ANALYSIS                         ║\n")
+cat("╚════════════════════════════════════════════════════════════════════════╝\n\n")
+
+# Combine horizon metrics from all river models
+if (!is.null(IWW_lstm) && !is.null(Miss_lstm)) {
+  
+  horizon_comparison <- bind_rows(
+    IWW_lstm$horizon_metrics |> mutate(River = "Illinois Waterway"),
+    Miss_lstm$horizon_metrics |> mutate(River = "Mississippi River")
+  )
+  
+  if (!is.null(Combined_lstm)) {
+    horizon_comparison <- bind_rows(
+      horizon_comparison,
+      Combined_lstm$horizon_metrics |> mutate(River = "Combined")
+    )
+  }
+  
+  # Summary at key horizons
+  key_horizons <- c(1, 7, 14, 21, 30, 45)
+  key_horizons <- key_horizons[key_horizons <= max(horizon_comparison$Horizon)]
+  
+  cat("=== RMSE at Key Forecast Horizons ===\n")
+  horizon_summary <- horizon_comparison |>
+    filter(Horizon %in% key_horizons) |>
+    select(Horizon, River, RMSE) |>
+    pivot_wider(names_from = River, values_from = RMSE) |>
+    mutate(across(where(is.numeric), ~round(.x, 3)))
+  
+  print(horizon_summary)
+  
+  # Performance degradation
+  cat("\n=== Forecast Degradation (RMSE increase from Step 1) ===\n")
+  degradation <- horizon_comparison |>
+    group_by(River) |>
+    mutate(
+      RMSE_Step1 = first(RMSE),
+      Pct_Increase = round((RMSE - RMSE_Step1) / RMSE_Step1 * 100, 1)
+    ) |>
+    filter(Horizon %in% key_horizons) |>
+    select(Horizon, River, RMSE, Pct_Increase) |>
+    pivot_wider(names_from = River, values_from = c(RMSE, Pct_Increase))
+  
+  print(degradation)
+}
+
+# ----------------------------------------------------------------------------
+# 2. HORIZON RMSE LINE PLOT
+# ----------------------------------------------------------------------------
+
+if (!is.null(IWW_lstm) && !is.null(Miss_lstm)) {
+  
+  p_horizon_rmse <- ggplot(horizon_comparison, aes(x = Horizon, y = RMSE, color = River)) +
+    geom_line(linewidth = 1.2) +
+    geom_point(size = 2) +
+    geom_vline(xintercept = c(7, 14, 30), linetype = "dashed", alpha = 0.5) +
+    annotate("text", x = 7, y = max(horizon_comparison$RMSE) * 0.95, 
+             label = "1 week", hjust = -0.1, size = 3) +
+    annotate("text", x = 14, y = max(horizon_comparison$RMSE) * 0.95, 
+             label = "2 weeks", hjust = -0.1, size = 3) +
+    annotate("text", x = 30, y = max(horizon_comparison$RMSE) * 0.95, 
+             label = "~1 month", hjust = -0.1, size = 3) +
+    scale_color_viridis_d(option = "plasma", end = 0.8) +
+    labs(
+      title = "LSTM Forecast Performance by Horizon",
+      subtitle = "RMSE increases as forecast distance grows",
+      x = "Forecast Horizon (observations ahead)",
+      y = "RMSE (ft/yr)",
+      color = "Dataset"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p_horizon_rmse)
+  ggsave("./Output/LSTM/Horizon_RMSE_Comparison.png", width = 12, height = 8)
+}
+
+# ----------------------------------------------------------------------------
+# 3. FACETED PREDICTIONS BY HORIZON (River-Level)
+# ----------------------------------------------------------------------------
+
+create_horizon_prediction_plot <- function(lstm_result, dataset_name, horizons_to_plot = c(1, 7, 15, 30, 45)) {
+  
+  if (is.null(lstm_result)) return(NULL)
+  
+  # Filter to available horizons
+  max_horizon <- ncol(lstm_result$predictions$actual)
+  horizons_to_plot <- horizons_to_plot[horizons_to_plot <= max_horizon]
+  
+  # Build data for plotting
+  plot_data <- map_dfr(horizons_to_plot, function(h) {
+    data.frame(
+      Horizon = paste0("Step ", h),
+      Horizon_Num = h,
+      Date = as.Date(lstm_result$predictions$dates),
+      Actual = lstm_result$predictions$actual[, h],
+      Predicted = lstm_result$predictions$predicted[, h]
+    )
+  }) |>
+    mutate(Horizon = factor(Horizon, levels = paste0("Step ", horizons_to_plot)))
+  
+  # Calculate metrics per horizon
+  metrics_data <- plot_data |>
+    group_by(Horizon, Horizon_Num) |>
+    summarise(
+      RMSE = sqrt(mean((Predicted - Actual)^2)),
+      MAE = mean(abs(Predicted - Actual)),
+      R2 = cor(Actual, Predicted)^2,
+      .groups = "drop"
+    ) |>
+    mutate(label = sprintf("RMSE: %.2f\nR²: %.2f", RMSE, R2))
+  
+  # Time series plot
+  p_ts <- plot_data |>
+    pivot_longer(cols = c(Actual, Predicted), names_to = "Type", values_to = "Rate") |>
+    ggplot(aes(x = Date, y = Rate, color = Type)) +
+    geom_line(alpha = 0.7, linewidth = 0.8) +
+    geom_text(data = metrics_data, aes(x = min(plot_data$Date), y = Inf, label = label),
+              hjust = 0, vjust = 1.5, size = 3, inherit.aes = FALSE) +
+    facet_wrap(~Horizon, ncol = 1, scales = "free_y") +
+    scale_color_manual(values = c("Actual" = "#2166AC", "Predicted" = "#D6604D")) +
+    labs(
+      title = paste(dataset_name, "- Predictions at Different Forecast Horizons"),
+      x = "Date",
+      y = "Shoaling Rate (ft/yr)",
+      color = ""
+    ) +
+    theme_minimal() +
+    theme(
+      legend.position = "bottom",
+      strip.text = element_text(face = "bold")
+    )
+  
+  # Scatter plot
+  p_scatter <- plot_data |>
+    ggplot(aes(x = Actual, y = Predicted)) +
+    geom_point(alpha = 0.5, size = 1.5, color = "#4575B4") +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+    geom_smooth(method = "lm", se = TRUE, color = "#D73027", alpha = 0.2) +
+    facet_wrap(~Horizon, ncol = 3, scales = "fixed") +
+    labs(
+      title = paste(dataset_name, "- Actual vs Predicted by Horizon"),
+      x = "Actual (ft/yr)",
+      y = "Predicted (ft/yr)"
+    ) +
+    theme_minimal() +
+    coord_fixed()
+  
+  return(list(timeseries = p_ts, scatter = p_scatter, metrics = metrics_data))
+}
+
+# Generate plots for each river
+if (!is.null(IWW_lstm)) {
+  iww_horizon_plots <- create_horizon_prediction_plot(IWW_lstm, "Illinois Waterway")
+  print(iww_horizon_plots$timeseries)
+  ggsave("./Output/LSTM/IWW_Horizon_Timeseries.png", width = 14, height = 16)
+  print(iww_horizon_plots$scatter)
+  ggsave("./Output/LSTM/IWW_Horizon_Scatter.png", width = 14, height = 10)
+}
+
+if (!is.null(Miss_lstm)) {
+  miss_horizon_plots <- create_horizon_prediction_plot(Miss_lstm, "Mississippi River")
+  print(miss_horizon_plots$timeseries)
+  ggsave("./Output/LSTM/Miss_Horizon_Timeseries.png", width = 14, height = 16)
+  print(miss_horizon_plots$scatter)
+  ggsave("./Output/LSTM/Miss_Horizon_Scatter.png", width = 14, height = 10)
+}
+
+# ----------------------------------------------------------------------------
+# 4. HEATMAP OF PREDICTIONS ACROSS ALL HORIZONS
+# ----------------------------------------------------------------------------
+
+create_horizon_heatmap <- function(lstm_result, dataset_name) {
+  
+  if (is.null(lstm_result)) return(NULL)
+  
+  # Create matrix of predictions
+  n_test <- nrow(lstm_result$predictions$actual)
+  n_horizon <- ncol(lstm_result$predictions$actual)
+  
+  # Calculate error at each point
+  error_matrix <- lstm_result$predictions$predicted - lstm_result$predictions$actual
+  
+  # Convert to long format
+  error_df <- expand.grid(
+    Sample = 1:n_test,
+    Horizon = 1:n_horizon
+  ) |>
+    mutate(
+      Error = as.vector(error_matrix),
+      Date = rep(as.Date(lstm_result$predictions$dates), n_horizon)
+    )
+  
+  # Heatmap
+  p_heatmap <- ggplot(error_df, aes(x = Horizon, y = Sample, fill = Error)) +
+    geom_tile() +
+    scale_fill_gradient2(
+      low = "#2166AC", mid = "white", high = "#D6604D",
+      midpoint = 0,
+      name = "Prediction\nError (ft/yr)"
+    ) +
+    labs(
+      title = paste(dataset_name, "- Prediction Error Heatmap"),
+      subtitle = "Blue = Under-prediction, Red = Over-prediction",
+      x = "Forecast Horizon",
+      y = "Test Sample"
+    ) +
+    theme_minimal()
+  
+  return(p_heatmap)
+}
+
+if (!is.null(IWW_lstm)) {
+  p_iww_heatmap <- create_horizon_heatmap(IWW_lstm, "Illinois Waterway")
+  print(p_iww_heatmap)
+  ggsave("./Output/LSTM/IWW_Error_Heatmap.png", width = 12, height = 10)
+}
+
+if (!is.null(Miss_lstm)) {
+  p_miss_heatmap <- create_horizon_heatmap(Miss_lstm, "Mississippi River")
+  print(p_miss_heatmap)
+  ggsave("./Output/LSTM/Miss_Error_Heatmap.png", width = 12, height = 10)
+}
+
+# ----------------------------------------------------------------------------
+# 5. WEEKLY FORECAST SUMMARY (if horizon represents ~weekly intervals)
+# ----------------------------------------------------------------------------
+
+cat("\n=== Weekly Forecast Performance Summary ===\n")
+
+if (!is.null(IWW_lstm)) {
+  
+  # Assuming each step is roughly 1 observation, group into weekly bins
+  # Adjust based on your actual temporal spacing
+  weekly_summary <- IWW_lstm$horizon_metrics |>
+    mutate(
+      Week = ceiling(Horizon / 7),
+      Week_Label = paste0("Week ", Week)
+    ) |>
+    group_by(Week, Week_Label) |>
+    summarise(
+      Horizons = paste(min(Horizon), "-", max(Horizon)),
+      Avg_RMSE = round(mean(RMSE), 3),
+      Avg_MAE = round(mean(MAE), 3),
+      .groups = "drop"
+    )
+  
+  cat("\nIllinois Waterway - Weekly Averaged Performance:\n")
+  print(weekly_summary)
+  
+  # Weekly bar plot
+  p_weekly <- weekly_summary |>
+    ggplot(aes(x = Week_Label, y = Avg_RMSE, fill = Avg_RMSE)) +
+    geom_col(alpha = 0.8) +
+    geom_text(aes(label = round(Avg_RMSE, 2)), vjust = -0.5, size = 3) +
+    scale_fill_viridis_c(option = "plasma", direction = -1) +
+    labs(
+      title = "Illinois Waterway - LSTM Performance by Forecast Week",
+      x = "Forecast Week",
+      y = "Average RMSE (ft/yr)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  print(p_weekly)
+  ggsave("./Output/LSTM/IWW_Weekly_RMSE.png", width = 10, height = 6)
+}
+
+if (!is.null(Miss_lstm)) {
+  
+  weekly_summary_miss <- Miss_lstm$horizon_metrics |>
+    mutate(
+      Week = ceiling(Horizon / 7),
+      Week_Label = paste0("Week ", Week)
+    ) |>
+    group_by(Week, Week_Label) |>
+    summarise(
+      Horizons = paste(min(Horizon), "-", max(Horizon)),
+      Avg_RMSE = round(mean(RMSE), 3),
+      Avg_MAE = round(mean(MAE), 3),
+      .groups = "drop"
+    )
+  
+  cat("\nMississippi River - Weekly Averaged Performance:\n")
+  print(weekly_summary_miss)
+  
+  p_weekly_miss <- weekly_summary_miss |>
+    ggplot(aes(x = Week_Label, y = Avg_RMSE, fill = Avg_RMSE)) +
+    geom_col(alpha = 0.8) +
+    geom_text(aes(label = round(Avg_RMSE, 2)), vjust = -0.5, size = 3) +
+    scale_fill_viridis_c(option = "plasma", direction = -1) +
+    labs(
+      title = "Mississippi River - LSTM Performance by Forecast Week",
+      x = "Forecast Week",
+      y = "Average RMSE (ft/yr)"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "none")
+  
+  print(p_weekly_miss)
+  ggsave("./Output/LSTM/Miss_Weekly_RMSE.png", width = 10, height = 6)
+}
+
+# ----------------------------------------------------------------------------
+# 6. COMBINED WEEKLY COMPARISON
+# ----------------------------------------------------------------------------
+
+if (!is.null(IWW_lstm) && !is.null(Miss_lstm)) {
+  
+  # Combine weekly summaries
+  combined_weekly <- bind_rows(
+    IWW_lstm$horizon_metrics |>
+      mutate(Week = ceiling(Horizon / 7), River = "Illinois Waterway"),
+    Miss_lstm$horizon_metrics |>
+      mutate(Week = ceiling(Horizon / 7), River = "Mississippi River")
+  ) |>
+    group_by(Week, River) |>
+    summarise(
+      Avg_RMSE = mean(RMSE),
+      Avg_MAE = mean(MAE),
+      .groups = "drop"
+    ) |>
+    mutate(Week_Label = paste0("Week ", Week))
+  
+  p_combined_weekly <- ggplot(combined_weekly, aes(x = Week_Label, y = Avg_RMSE, fill = River)) +
+    geom_col(position = "dodge", alpha = 0.8) +
+    scale_fill_manual(values = c("Illinois Waterway" = "orange", "Mississippi River" = "dodgerblue")) +
+    labs(
+      title = "LSTM Forecast Performance Comparison by Week",
+      subtitle = "Average RMSE across forecast horizons grouped by week",
+      x = "Forecast Week",
+      y = "Average RMSE (ft/yr)",
+      fill = "River System"
+    ) +
+    theme_minimal() +
+    theme(legend.position = "bottom")
+  
+  print(p_combined_weekly)
+  ggsave("./Output/LSTM/Combined_Weekly_RMSE.png", width = 12, height = 7)
+}
+
+# ----------------------------------------------------------------------------
+# 7. FORECAST CONFIDENCE BANDS
+# ----------------------------------------------------------------------------
+
+create_forecast_confidence_plot <- function(lstm_result, dataset_name) {
+  
+  if (is.null(lstm_result)) return(NULL)
+  
+  # Calculate prediction intervals at each horizon
+  horizon_stats <- data.frame(
+    Horizon = 1:lstm_result$metrics$Forecast_Horizon,
+    RMSE = lstm_result$horizon_metrics$RMSE
+  ) |>
+    mutate(
+      # Approximate 95% confidence interval using RMSE
+      CI_Lower = -1.96 * RMSE,
+      CI_Upper = 1.96 * RMSE
+    )
+  
+  p_confidence <- ggplot(horizon_stats, aes(x = Horizon)) +
+    geom_ribbon(aes(ymin = CI_Lower, ymax = CI_Upper), fill = "steelblue", alpha = 0.3) +
+    geom_line(aes(y = 0), linetype = "dashed", color = "black") +
+    geom_line(aes(y = RMSE), color = "red", linewidth = 1) +
+    geom_line(aes(y = -RMSE), color = "red", linewidth = 1) +
+    labs(
+      title = paste(dataset_name, "- Forecast Uncertainty by Horizon"),
+      subtitle = "Blue band = 95% CI, Red lines = ±1 RMSE",
+      x = "Forecast Horizon (steps ahead)",
+      y = "Expected Error Range (ft/yr)"
+    ) +
+    theme_minimal()
+  
+  return(p_confidence)
+}
+
+if (!is.null(IWW_lstm)) {
+  p_iww_conf <- create_forecast_confidence_plot(IWW_lstm, "Illinois Waterway")
+  print(p_iww_conf)
+  ggsave("./Output/LSTM/IWW_Forecast_Confidence.png", width = 10, height = 6)
+}
+
+if (!is.null(Miss_lstm)) {
+  p_miss_conf <- create_forecast_confidence_plot(Miss_lstm, "Mississippi River")
+  print(p_miss_conf)
+  ggsave("./Output/LSTM/Miss_Forecast_Confidence.png", width = 10, height = 6)
+}
+
+# ----------------------------------------------------------------------------
+# 8. SUMMARY TABLE FOR PAPER
+# ----------------------------------------------------------------------------
+
+cat("\n")
+cat("╔════════════════════════════════════════════════════════════════════════╗\n")
+cat("║              LSTM HORIZON SUMMARY (FOR PAPER)                          ║\n")
+cat("╚════════════════════════════════════════════════════════════════════════╝\n\n")
+
+if (!is.null(IWW_lstm) && !is.null(Miss_lstm)) {
+  
+  paper_summary <- horizon_comparison |>
+    filter(Horizon %in% c(1, 7, 14, 30, max(Horizon))) |>
+    mutate(
+      Horizon_Label = case_when(
+        Horizon == 1 ~ "1-step",
+        Horizon == 7 ~ "1-week",
+        Horizon == 14 ~ "2-week",
+        Horizon == 30 ~ "1-month",
+        TRUE ~ paste0(Horizon, "-step")
+      )
+    ) |>
+    select(Horizon_Label, River, RMSE, MAE) |>
+    mutate(
+      RMSE = round(RMSE, 3),
+      MAE = round(MAE, 3)
+    )
+  
+  cat("Table: LSTM Performance at Key Forecast Horizons\n\n")
+  print(paper_summary |> pivot_wider(names_from = River, values_from = c(RMSE, MAE)))
+  
+  # Save for paper
+  write_csv(paper_summary, "./Output/LSTM/Horizon_Summary_Table.csv")
+  cat("\nSaved to ./Output/LSTM/Horizon_Summary_Table.csv\n")
+}
+```
+
+
+
+# Save Results
+
+```{r save-results}
+# Save regression results
+write_csv(river_results, "./Output/Comparisons/River_Level_Results.csv")
+
+# Save classification results
+write_csv(classification_results, "./Output/Comparisons/Classification_Results.csv")
+
+# Save pool results
+if (!is.null(pool_xgb_metrics)) {
+write_csv(pool_xgb_metrics, "./Output/Pool_Models/Pool_xGBoost_Results.csv")
+}
+
+if (!is.null(pool_lstm_metrics)) {
+write_csv(pool_lstm_metrics, "./Output/Pool_Models/Pool_LSTM_Results.csv")
+}
+
+# Save pool-gage mapping
+mapping_df <- data.frame(
+Key = names(pool_gage_mapping),
+Pool = sapply(pool_gage_mapping, function(x) x$pool),
+River = sapply(pool_gage_mapping, function(x) x$river_code),
+N_Samples = sapply(pool_gage_mapping, function(x) x$n_samples),
+N_Gages = sapply(pool_gage_mapping, function(x) x$n_selected_gages),
+Gages = sapply(pool_gage_mapping, function(x) paste(x$selected_gages, collapse = ", "))
+)
+write_csv(mapping_df, "./Output/Pool_Models/Pool_Gage_Mapping.csv")
+
+
+```
+
+# Recommendations
+
+```{r recommendations}
+generate_recommendations <- function(river_name, regression_data, classification_data) {
+
+best_ml <- regression_data |>
+  filter(River == river_name, Model %in% c("xGBoost", "LSTM")) |>
+  slice_min(Test_RMSE, n = 1)
+
+best_baseline <- regression_data |>
+  filter(River == river_name, Type == "Baseline") |>
+  slice_min(Test_RMSE, n = 1)
+
+best_class <- classification_data |>
+  filter(Dataset == river_name) |>
+  slice_max(F1_Score, n = 1)
+
+improvement <- (best_baseline$Test_RMSE - best_ml$Test_RMSE) / best_baseline$Test_RMSE * 100
+
+cat(sprintf("\n=== %s ===\n", river_name))
+cat(sprintf("Best Regression Model: %s (RMSE: %.4f, %.1f%% improvement)\n",
+            best_ml$Model, best_ml$Test_RMSE, improvement))
+cat(sprintf("Best Classification Model: %s (F1: %.3f)\n",
+            best_class$Model, best_class$F1_Score))
+
+if (best_ml$Model == "LSTM") {
+  cat("  → Use for: Long-range planning (30-45 days ahead)\n")
+} else {
+  cat("  → Use for: Real-time predictions, operational deployment\n")
+}
+}
+
+generate_recommendations("Illinois Waterway", river_results, classification_results)
+generate_recommendations("Mississippi River", river_results, classification_results)
+generate_recommendations("Combined", river_results, classification_results)
+```
+
+# Stop Parallel Processing
+```{r cleanup}
+# Stop parallel processing cluster
+stopCluster(cl)
+```

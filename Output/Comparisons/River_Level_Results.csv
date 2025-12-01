@@ -1,0 +1,16 @@
+Model,Test_RMSE,Test_MAE,Dataset,River,Type
+Mean,2.030291521164918,1.1600127579797206,Illinois Waterway,Illinois Waterway,Baseline
+ARIMA,2.0308381851785984,1.1600176757261287,Illinois Waterway,Illinois Waterway,Baseline
+Persistence,2.622332742840471,1.5742110236220472,Illinois Waterway,Illinois Waterway,Baseline
+Mean,3.6446198050025074,1.8580090136670344,Mississippi River,Mississippi River,Baseline
+ARIMA,3.6447368597466725,1.858503163589587,Mississippi River,Mississippi River,Baseline
+Persistence,4.429929131529526,2.2428100120627263,Mississippi River,Mississippi River,Baseline
+Mean,3.5283551060198803,1.8361718174235513,Combined,Combined,Baseline
+ARIMA,3.5285132756398334,1.8360239358899269,Combined,Combined,Baseline
+Persistence,4.367065288231376,2.266710732984293,Combined,Combined,Baseline
+xGBoost,1.8435892600414898,1.0437516927483346,Illinois Waterway,Illinois Waterway,ML
+xGBoost,3.239148512331183,1.6473715132572586,Mississippi River,Mississippi River,ML
+xGBoost,3.1809483726269807,1.6660040280098978,Combined,Combined,ML
+LSTM,1.6348768989862927,0.769046564439321,Illinois Waterway,Illinois Waterway,ML
+LSTM,2.8239424402155113,1.494326682048646,Mississippi River,Mississippi River,ML
+LSTM,2.6103060823120274,1.3701985999298845,Combined,Combined,ML

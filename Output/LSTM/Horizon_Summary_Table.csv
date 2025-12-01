@@ -1,0 +1,16 @@
+Horizon_Label,River,RMSE,MAE
+1-step,Illinois Waterway,1.635,0.769
+1-week,Illinois Waterway,1.633,0.747
+2-week,Illinois Waterway,1.643,0.812
+1-month,Illinois Waterway,1.695,0.839
+45-step,Illinois Waterway,1.703,0.822
+1-step,Mississippi River,2.824,1.494
+1-week,Mississippi River,2.844,1.522
+2-week,Mississippi River,2.844,1.52
+1-month,Mississippi River,2.864,1.531
+45-step,Mississippi River,2.881,1.551
+1-step,Combined,2.61,1.37
+1-week,Combined,2.619,1.365
+2-week,Combined,2.627,1.371
+1-month,Combined,2.642,1.38
+45-step,Combined,2.652,1.39
