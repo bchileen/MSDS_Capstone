@@ -212,8 +212,7 @@ gage_CSAT_joined <- CSAT_data_cleaned |>
 left_join(
   gage_data_interpolated,
   by = c("SurveyDateBefore" = "Date")
-) |>
-select(-SurveyYear, -SurveyMonth, -SurveyWeekOfYear)
+) 
 
 # Check pool sample counts
 pool_counts <- gage_CSAT_joined |>
@@ -424,13 +423,6 @@ high_cor_pairs<- function(cor_mat, threshold = 0.7){
 }
 }
 
-
-high_cors<-high_cor_pairs(cor_matrix, 0.9)
-
-### Omit self-correlated variables 
-filtered_cors<- high_cors |>
-  filter(var1 != var2)
-
 ### Plot the corrplot 
 library(corrplot)
 corrplot(cor_matrix, tl.cex = 0.75, type = "upper", method = "color",
@@ -601,10 +593,10 @@ cat("Complete cases for PCA:", nrow(pca_data_complete), "out of", nrow(gage_CSAT
  
 Comb_Viz <- gage_CSAT_joined |>
   dplyr::slice(as.numeric(rownames(pca_data_complete))) |>  
-  select(SurveyDateBefore, SurveySeason, Day, Month, WeekOfYear,
-         river, pool) |>
+  select(SurveyDateBefore, Day, Month, WeekOfYear,
+         river, pool, Season) |>
   mutate(
-    season = factor(SurveySeason, levels = c("Winter", "Spring", "Summer", "Fall")),
+    season = factor(Season, levels = c("Winter", "Spring", "Summer", "Fall")),
     river_system = factor(river),
     pool_name = factor(pool),
     week_of_year = WeekOfYear)
@@ -691,20 +683,20 @@ Miss_cumulative_variance <- summary(Miss_PCA)$importance[3, ] * 100
 # Biplots of Miss and IL
 IWW_Viz <- gage_CSAT_joined |>
   dplyr::slice(as.numeric(rownames(IWW_pca_data))) |>  # Match rows used in PCA
-  select(SurveyDateBefore, SurveySeason, Day, Month, WeekOfYear,
+  select(SurveyDateBefore, Season, Day, Month, WeekOfYear,
          river, pool) |>
   mutate(
-    season = factor(SurveySeason, levels = c("Winter", "Spring", "Summer", "Fall")),
+    season = factor(Season, levels = c("Winter", "Spring", "Summer", "Fall")),
     river_system = factor(river),
     pool_name = factor(pool),
     week_of_year = WeekOfYear)
 
 Miss_Viz <- gage_CSAT_joined |>
   dplyr::slice(as.numeric(rownames(Miss_pca_data))) |>  # Match rows used in PCA
-  select(SurveyDateBefore, SurveySeason, Day, Month, WeekOfYear,
+  select(SurveyDateBefore, Season, Day, Month, WeekOfYear,
          river, pool) |>
   mutate(
-    season = factor(SurveySeason, levels = c("Winter", "Spring", "Summer", "Fall")),
+    season = factor(Season, levels = c("Winter", "Spring", "Summer", "Fall")),
     river_system = factor(river),
     pool_name = factor(pool),
     week_of_year = WeekOfYear)
@@ -1419,6 +1411,522 @@ build_lstm_model<- function(sequence_length, n_features, forecast_horizon) {
 ```
 
 ## Build LSTM Training Function
+
+```{r}
+build_forecast_lstm_model <- function(sequence_length, n_features, forecast_horizon) {
+  model <- keras_model_sequential() |>
+    # First LSTM layer - unidirectional for proper forecasting
+    layer_lstm(
+      units = 128,
+      return_sequences = TRUE,
+      input_shape = c(sequence_length, n_features),
+      dropout = 0.2,
+      recurrent_dropout = 0.1
+    ) |>
+    layer_batch_normalization() |>
+    
+    # Second LSTM layer
+    layer_lstm(
+      units = 64,
+      return_sequences = TRUE,
+      dropout = 0.2
+    ) |>
+    layer_batch_normalization() |>
+    
+    # Third LSTM layer
+    layer_lstm(
+      units = 32,
+      return_sequences = FALSE,
+      dropout = 0.1
+    ) |>
+    
+    # Dense layers with residual connection
+    layer_dense(units = 64, activation = "relu") |>
+    layer_dropout(rate = 0.2) |>
+    layer_dense(units = 32, activation = "relu") |>
+    layer_dense(units = forecast_horizon, activation = "linear")
+  
+  # Compile with adaptive learning rate
+  model |> compile(
+    optimizer = optimizer_adam(learning_rate = 0.001),
+    loss = "mse",
+    metrics = c("mae")
+  )
+  
+  return(model)
+}
+```
+
+## Prepare the data
+```{r}
+prepare_forecast_data <- function(data, gages_to_use,
+                                 sequence_length = 30,
+                                 forecast_horizon = 28,
+                                 dataset_name = "Dataset") {
+  
+  cat(sprintf("\n--- Preparing Enhanced Forecast Data: %s ---\n", dataset_name))
+  
+  # Sort and prepare data with enhanced temporal features
+  feature_data <- data |>
+    select(
+      SurveyDateBefore, AnnualShoalingRate_ftperyr,
+      DaysBetween, WeekOfYear, any_of(gages_to_use)
+    ) |>
+    arrange(SurveyDateBefore) |>
+    drop_na() |>
+    mutate(
+      # Temporal gap features
+      days_since_last = as.numeric(SurveyDateBefore - lag(SurveyDateBefore)),
+      days_since_last = ifelse(is.na(days_since_last), 0, days_since_last),
+      
+      # Calendar features
+      month = month(SurveyDateBefore),
+      day_of_month = day(SurveyDateBefore),
+      
+      # Cyclical encoding of temporal features
+      month_sin = sin(2 * pi * month / 12),
+      month_cos = cos(2 * pi * month / 12),
+      week_sin = sin(2 * pi * WeekOfYear / 52),
+      week_cos = cos(2 * pi * WeekOfYear / 52),
+      
+      # Lag features of the target variable
+      target_lag1 = lag(AnnualShoalingRate_ftperyr, 1),
+      target_lag2 = lag(AnnualShoalingRate_ftperyr, 2),
+      target_lag3 = lag(AnnualShoalingRate_ftperyr, 3),
+      
+      # Rolling statistics of the target
+      target_rolling_mean = rollapply(AnnualShoalingRate_ftperyr, 3, mean, fill = NA, align = "right"),
+      target_rolling_std = rollapply(AnnualShoalingRate_ftperyr, 3, sd, fill = NA, align = "right")
+    ) |>
+    # Remove rows with NAs from the lag features
+    filter(row_number() > 3)
+  
+  cat(sprintf("Initial data: %d observations\n", nrow(feature_data)))
+  
+  # Extract and scale features
+  gage_cols <- intersect(gages_to_use, names(feature_data))
+  feature_cols <- c(
+    "DaysBetween", "WeekOfYear", "days_since_last", 
+    "month_sin", "month_cos", "week_sin", "week_cos",
+    "target_lag1", "target_lag2", "target_lag3",
+    "target_rolling_mean", "target_rolling_std",
+    gage_cols
+  )
+  
+  feature_matrix <- feature_data |>
+    select(all_of(feature_cols)) |>
+    as.matrix()
+  
+  feature_means <- colMeans(feature_matrix, na.rm = TRUE)
+  feature_sds <- apply(feature_matrix, 2, sd, na.rm = TRUE)
+  feature_sds[feature_sds == 0] <- 1
+  
+  scaled_features <- scale(feature_matrix, center = feature_means, scale = feature_sds)
+  
+  # Scale target
+  target_values <- feature_data$AnnualShoalingRate_ftperyr
+  target_mean <- mean(target_values, na.rm = TRUE)
+  target_sd <- sd(target_values, na.rm = TRUE)
+  scaled_target <- (target_values - target_mean) / target_sd
+  
+  dates <- feature_data$SurveyDateBefore
+  
+  # Create sequences for forecasting
+  n_samples <- nrow(scaled_features) - sequence_length - forecast_horizon + 1
+  n_features <- ncol(scaled_features)
+  
+  if (n_samples < 10) {
+    cat("WARNING: Too few sequences can be created\n")
+    return(NULL)
+  }
+  
+  X <- array(0, dim = c(n_samples, sequence_length, n_features))
+  y <- matrix(0, nrow = n_samples, ncol = forecast_horizon)
+  sample_dates <- character(n_samples)
+  forecast_dates <- list()
+  
+  for (i in 1:n_samples) {
+    X[i, , ] <- scaled_features[i:(i + sequence_length - 1), ]
+    y[i, ] <- scaled_target[(i + sequence_length):(i + sequence_length + forecast_horizon - 1)]
+    sample_dates[i] <- as.character(dates[i + sequence_length - 1])
+    forecast_dates[[i]] <- dates[(i + sequence_length):(i + sequence_length + forecast_horizon - 1)]
+  }
+  
+  # Temporal split
+  train_size <- floor(n_samples * 0.70)
+  val_size <- floor(n_samples * 0.15)
+  
+  lstm_data <- list(
+    X_train = X[1:train_size, , , drop = FALSE],
+    y_train = y[1:train_size, , drop = FALSE],
+    X_val = X[(train_size + 1):(train_size + val_size), , , drop = FALSE],
+    y_val = y[(train_size + 1):(train_size + val_size), , drop = FALSE],
+    X_test = X[(train_size + val_size + 1):n_samples, , , drop = FALSE],
+    y_test = y[(train_size + val_size + 1):n_samples, , drop = FALSE],
+    dates_train = sample_dates[1:train_size],
+    dates_val = sample_dates[(train_size + 1):(train_size + val_size)],
+    dates_test = sample_dates[(train_size + val_size + 1):n_samples],
+    forecast_dates_test = forecast_dates[(train_size + val_size + 1):n_samples],
+    feature_means = feature_means,
+    feature_sds = feature_sds,
+    target_mean = target_mean,
+    target_sd = target_sd,
+    sequence_length = sequence_length,
+    forecast_horizon = forecast_horizon,
+    n_features = n_features,
+    feature_names = feature_cols,
+    dataset_name = dataset_name
+  )
+  
+  return(lstm_data)
+}
+
+```
+
+### Train the model
+```{r}
+train_forecast_lstm_model <- function(lstm_data, dataset_name,
+                                     epochs = 150, batch_size = 32, patience = 25, threshold) {
+  
+  if (is.null(lstm_data)) {
+    cat(sprintf("Skipping %s - no data prepared\n", dataset_name))
+    return(NULL)
+  }
+  
+  cat(sprintf("\n=== Training Forecast LSTM: %s ===\n", dataset_name))
+  
+  # Build model
+  model <- build_forecast_lstm_model(
+    sequence_length = lstm_data$sequence_length,
+    n_features = lstm_data$n_features,
+    forecast_horizon = lstm_data$forecast_horizon
+  )
+  
+  # Enhanced callbacks
+  callbacks <- list(
+    callback_early_stopping(
+      monitor = 'val_loss',
+      patience = patience,
+      restore_best_weights = TRUE,
+      verbose = 1
+    ),
+    callback_reduce_lr_on_plateau(
+      monitor = 'val_loss',
+      factor = 0.2,
+      patience = 10,
+      min_lr = 1e-6,
+      verbose = 1
+    ),
+    callback_model_checkpoint(
+      filepath = paste0("lstm_", gsub(" ", "_", dataset_name), "_checkpoint"),
+      save_best_only = TRUE,
+      monitor = "val_loss"
+    )
+  )
+  
+  # Train with a two-phase approach
+  start_time <- Sys.time()
+  
+  # Phase 1: Initial training
+  history1 <- model |> fit(
+    x = lstm_data$X_train,
+    y = lstm_data$y_train,
+    validation_data = list(lstm_data$X_val, lstm_data$y_val),
+    epochs = floor(epochs * 0.7),
+    batch_size = batch_size,
+    callbacks = callbacks,
+    verbose = 1
+  )
+  
+  # Phase 2: Fine-tuning with lower learning rate
+  model |> compile(
+    optimizer = optimizer_adam(learning_rate = 1e-4),
+    loss = "mse",
+    metrics = c("mae")
+  )
+  
+  history2 <- model |> fit(
+    x = lstm_data$X_train,
+    y = lstm_data$y_train,
+    validation_data = list(lstm_data$X_val, lstm_data$y_val),
+    epochs = floor(epochs * 0.3),
+    batch_size = batch_size,
+    callbacks = callbacks,
+    verbose = 1
+  )
+  
+  training_time <- difftime(Sys.time(), start_time, units = "mins")
+  cat(sprintf("Training completed in %.1f minutes\n", training_time))
+  
+  # Generate predictions
+  test_pred_scaled <- predict(model, lstm_data$X_test)
+  test_pred <- test_pred_scaled * lstm_data$target_sd + lstm_data$target_mean
+  test_actual <- lstm_data$y_test * lstm_data$target_sd + lstm_data$target_mean
+  
+  # Calculate metrics
+  rmse_all <- sqrt(mean((test_pred - test_actual)^2))
+  mae_all <- mean(abs(test_pred - test_actual))
+  rmse_1step <- sqrt(mean((test_pred[, 1] - test_actual[, 1])^2))
+  mae_1step <- mean(abs(test_pred[, 1] - test_actual[, 1]))
+  
+  # Weekly metrics (for 28-day forecasts)
+  if (lstm_data$forecast_horizon >= 28) {
+    weekly_metrics <- data.frame(
+      Week = 1:4,
+      RMSE = sapply(1:4, function(w) {
+        start_idx <- (w-1)*7 + 1
+        end_idx <- min(w*7, lstm_data$forecast_horizon)
+        sqrt(mean((test_pred[, start_idx:end_idx] - test_actual[, start_idx:end_idx])^2))
+      }),
+      MAE = sapply(1:4, function(w) {
+        start_idx <- (w-1)*7 + 1
+        end_idx <- min(w*7, lstm_data$forecast_horizon)
+        mean(abs(test_pred[, start_idx:end_idx] - test_actual[, start_idx:end_idx]))
+      })
+    )
+    
+    cat("\nWeekly Forecast Performance:\n")
+    print(weekly_metrics)
+  }
+  
+   # Classification metrics (1-step)
+  class_metrics <- calculate_classification_metrics(test_actual[, 1], test_pred[, 1], threshold)
+  
+  cat(sprintf("\nTest Performance:\n"))
+  cat(sprintf("  All horizons - RMSE: %.4f, MAE: %.4f\n", rmse_all, mae_all))
+  cat(sprintf("  1-step ahead - RMSE: %.4f, MAE: %.4f\n", rmse_1step, mae_1step))
+  cat(sprintf("  Classification - Accuracy: %.1f%%, F1: %.3f\n",
+              class_metrics$accuracy * 100, class_metrics$f1))
+  
+  # Plot sample forecasts
+  plot_sample_forecasts <- function(n_samples = 3) {
+    par(mfrow = c(n_samples, 1), mar = c(4, 4, 2, 1))
+    
+    # Select random samples
+    sample_indices <- sample(1:nrow(test_pred), n_samples)
+    
+    for (idx in sample_indices) {
+      # Get actual and predicted values
+      actual <- test_actual[idx, ]
+      pred <- test_pred[idx, ]
+      
+      # Create x-axis (days ahead)
+      days_ahead <- 1:length(actual)
+      
+      # Plot
+      plot(days_ahead, actual, type = "l", col = "blue", 
+           main = paste("Forecast from", lstm_data$dates_test[idx]),
+           xlab = "Days Ahead", ylab = "Shoaling Rate (ft/yr)")
+      lines(days_ahead, pred, col = "red")
+      legend("topright", legend = c("Actual", "Predicted"), 
+             col = c("blue", "red"), lty = 1)
+    }
+    
+    par(mfrow = c(1, 1))
+  }
+  
+  # Plot sample forecasts
+  plot_sample_forecasts(3)
+  
+  return(list(
+    model = model,
+    history = list(phase1 = history1, phase2 = history2),
+    dataset_name = dataset_name,
+    training_time = training_time,
+    metrics = data.frame(
+      Dataset = dataset_name,
+      Model = "Forecast LSTM",
+      Test_RMSE_All = rmse_all,
+      Test_MAE_All = mae_all,
+      Test_RMSE_1Step = rmse_1step,
+      Test_MAE_1Step = mae_1step,
+      Accuracy = class_metrics$accuracy,
+      Precision = class_metrics$precision,
+      Recall = class_metrics$recall,
+      F1_Score = class_metrics$f1,
+      Forecast_Horizon = lstm_data$forecast_horizon
+    ),
+    weekly_metrics = if (exists("weekly_metrics")) weekly_metrics else NULL,
+    predictions = list(
+      actual = test_actual,
+      predicted = test_pred,
+      dates_test = lstm_data$dates_test,
+      forecast_dates = lstm_data$forecast_dates_test
+    ),
+    confusion = class_metrics$confusion,
+    scalers = list(
+      feature_means = lstm_data$feature_means,
+      feature_sds = lstm_data$feature_sds,
+      target_mean = lstm_data$target_mean,
+      target_sd = lstm_data$target_sd
+    ),
+    plot_forecasts = plot_sample_forecasts
+  ))
+}
+
+# Function to generate forecasts from new data
+generate_lstm_forecast <- function(model_result, new_data, forecast_days = 28) {
+  # Extract model and scaling parameters
+  model <- model_result$model
+  feature_means <- model_result$scalers$feature_means
+  feature_sds <- model_result$scalers$feature_sds
+  target_mean <- model_result$scalers$target_mean
+  target_sd <- model_result$scalers$target_sd
+  sequence_length <- model_result$model$input_shape[[2]]
+  feature_names <- names(feature_means)
+  
+  # Prepare features from new data
+  new_features <- new_data |>
+    select(all_of(feature_names)) |>
+    as.matrix()
+  
+  # Scale features
+  scaled_features <- scale(new_features, center = feature_means, scale = feature_sds)
+  
+  # Create input sequence
+  X_new <- array(dim = c(1, sequence_length, ncol(scaled_features)))
+  X_new[1, , ] <- scaled_features[(nrow(scaled_features) - sequence_length + 1):nrow(scaled_features), ]
+  
+  # Generate prediction
+  pred_scaled <- predict(model, X_new)
+  pred <- pred_scaled * target_sd + target_mean
+  
+  # Create forecast dates
+  last_date <- new_data$SurveyDateBefore[nrow(new_data)]
+  forecast_dates <- seq(last_date + 1, by = "day", length.out = length(pred))
+  
+  # Create weekly summaries
+  weeks <- ceiling(seq_along(forecast_dates) / 7)
+  weekly_pred <- sapply(unique(weeks), function(w) mean(pred[1, weeks == w]))
+  weekly_dates <- sapply(unique(weeks), function(w) {
+    format(median(forecast_dates[weeks == w]), "%Y-%m-%d")
+  })
+  
+  # Return forecast
+  return(list(
+    daily_forecast = data.frame(
+      Date = forecast_dates,
+      ShoalingRate = as.numeric(pred[1, ])
+    ),
+    weekly_forecast = data.frame(
+      Week = unique(weeks),
+      WeekEnding = weekly_dates,
+      ShoalingRate = weekly_pred
+    ),
+    model_name = model_result$dataset_name
+  ))
+}
+
+# Test river-level implementation
+test_river_level_lstm <- function() {
+  cat("Testing River-Level LSTM Implementation\n")
+  
+  # Prepare data for Illinois Waterway
+  IWW_forecast_data <- prepare_forecast_data(
+    IWW_data, IWW_gages,
+    sequence_length = 30, forecast_horizon = 28,
+    dataset_name = "Illinois Waterway"
+  )
+  
+  # Train model
+  IWW_lstm_model <- train_forecast_lstm_model(
+    IWW_forecast_data, "Illinois Waterway", 
+    threshold = IWW_thresh
+  )
+  
+  # Generate a forecast using the most recent data
+  recent_data <- tail(IWW_data, 30 + 10)  # Get enough data for sequence + buffer
+  IWW_forecast <- generate_lstm_forecast(
+    IWW_lstm_model, recent_data, forecast_days = 28
+  )
+  
+  # Plot the forecast
+  plot(
+    IWW_forecast$daily_forecast$Date, 
+    IWW_forecast$daily_forecast$ShoalingRate,
+    type = "l", col = "red", 
+    main = "28-Day Illinois Waterway Shoaling Forecast",
+    xlab = "Date", ylab = "Shoaling Rate (ft/yr)"
+  )
+  abline(h = IWW_thresh, lty = 2, col = "blue")
+  legend("topright", legend = c("Forecast", "Dredging Threshold"), 
+         col = c("red", "blue"), lty = c(1, 2))
+  
+  # Return the model and forecast
+  return(list(model = IWW_lstm_model, forecast = IWW_forecast))
+}
+
+# Test pool-level implementation
+test_pool_level_lstm <- function(pool_name = "LA", river_code = "IL") {
+  cat(sprintf("Testing Pool-Level LSTM Implementation for %s (%s)\n", 
+              pool_name, river_code))
+  
+  # Get the relevant gages for this pool
+  key <- paste(river_code, pool_name, sep = "_")
+  if (!key %in% names(pool_gage_mapping)) {
+    stop(paste("No mapping found for pool:", pool_name))
+  }
+  
+  pool_map <- pool_gage_mapping[[key]]
+  selected_gages <- pool_map$selected_gages
+  
+  # Filter data for this pool
+  pool_data <- gage_CSAT_joined |>
+    filter(pool == pool_name, river == river_code) |>
+    arrange(SurveyDateBefore)
+  
+  if (nrow(pool_data) < 100) {
+    stop("Insufficient data for this pool")
+  }
+  
+  # Prepare data
+  pool_forecast_data <- prepare_forecast_data(
+    pool_data, selected_gages,
+    sequence_length = 20, forecast_horizon = 28,
+    dataset_name = paste("Pool", pool_name)
+  )
+  
+  # Train model
+  pool_lstm_model <- train_forecast_lstm_model(
+    pool_forecast_data, paste("Pool", pool_name),
+    threshold = pool_thresholds |> filter(pool == pool_name) |> pull(mean_rate)
+  )
+  
+  # Generate a forecast using the most recent data
+  recent_data <- tail(pool_data, 20 + 10)  # Get enough data for sequence + buffer
+  pool_forecast <- generate_lstm_forecast(
+    pool_lstm_model, recent_data, forecast_days = 28
+  )
+  
+  # Plot the forecast
+  plot(
+    pool_forecast$daily_forecast$Date, 
+    pool_forecast$daily_forecast$ShoalingRate,
+    type = "l", col = "red", 
+    main = paste("28-Day", pool_name, "Pool Shoaling Forecast"),
+    xlab = "Date", ylab = "Shoaling Rate (ft/yr)"
+  )
+  abline(h = pool_thresholds |> filter(pool == pool_name) |> pull(mean_rate), 
+         lty = 2, col = "blue")
+  legend("topright", legend = c("Forecast", "Dredging Threshold"), 
+         col = c("red", "blue"), lty = c(1, 2))
+  
+  # Return the model and forecast
+  return(list(model = pool_lstm_model, forecast = pool_forecast))
+}
+
+# Run the tests
+river_test <- test_river_level_lstm()
+pool_test <- test_pool_level_lstm("MARSEILLES", "IL")
+```
+
+
+
+
+
+
+##OLD
+
 ```{r lstm train function}
 train_lstm_model <- function(lstm_data, dataset_name,
                             epochs = 100, batch_size = 32, patience = 20, threshold) {
@@ -1558,6 +2066,7 @@ sequence_length = 25, forecast_horizon = 45,
 dataset_name = "Combined"
 )
 
+library(keras)
 # Train models
 IWW_lstm <- train_lstm_model(IWW_lstm_data, "Illinois Waterway", threshold = IWW_thresh)
 Miss_lstm <- train_lstm_model(Miss_lstm_data, "Mississippi River", threshold = Miss_thresh)
@@ -2253,8 +2762,7 @@ ggplot(pred_df, aes(x = actual, y = predicted)) +
     subtitle = sprintf("RMSE: %.3f | MAE: %.3f | R²: %.3f", rmse, mae, r2),
     x = "Actual (ft/yr)", y = "Predicted (ft/yr)"
   ) +
-  theme_minimal() +
-  coord_fixed()
+  theme_minimal()
 }
 
 # xGBoost plots
@@ -2289,8 +2797,8 @@ p_miss_lstm_ts <- plot_predictions(Miss_lstm_pred_df, "Mississippi River", "LSTM
 p_iww_lstm_sc <- plot_scatter(IWW_lstm_pred_df, "Illinois Waterway", "LSTM")
 p_miss_lstm_sc <- plot_scatter(Miss_lstm_pred_df, "Mississippi River", "LSTM")
 
-print((p_iww_lstm_ts + p_miss_lstm_ts) / (p_iww_lstm_sc + p_miss_lstm_sc))
-
+print(p_iww_lstm_ts + p_miss_lstm_ts)
+print(p_iww_lstm_sc + p_miss_lstm_sc)
 ggsave("./Output/Comparisons/LSTM_Predictions.png", width = 14, height = 12)
 }
 ```
@@ -2553,444 +3061,6 @@ if (!is.null(dredge_predictions) && nrow(dredge_predictions) > 0) {
 }
 
 ```
-## Dredging Priority Maps LSTM
-```{r}
-# ============================================================================
-# LSTM FORECAST HORIZON ANALYSIS AND VISUALIZATION
-# ============================================================================
-
-# ----------------------------------------------------------------------------
-# 1. HORIZON PERFORMANCE SUMMARY
-# ----------------------------------------------------------------------------
-
-cat("\n")
-cat("╔════════════════════════════════════════════════════════════════════════╗\n")
-cat("║                 LSTM FORECAST HORIZON ANALYSIS                         ║\n")
-cat("╚════════════════════════════════════════════════════════════════════════╝\n\n")
-
-# Combine horizon metrics from all river models
-if (!is.null(IWW_lstm) && !is.null(Miss_lstm)) {
-  
-  horizon_comparison <- bind_rows(
-    IWW_lstm$horizon_metrics |> mutate(River = "Illinois Waterway"),
-    Miss_lstm$horizon_metrics |> mutate(River = "Mississippi River")
-  )
-  
-  if (!is.null(Combined_lstm)) {
-    horizon_comparison <- bind_rows(
-      horizon_comparison,
-      Combined_lstm$horizon_metrics |> mutate(River = "Combined")
-    )
-  }
-  
-  # Summary at key horizons
-  key_horizons <- c(1, 7, 14, 21, 30, 45)
-  key_horizons <- key_horizons[key_horizons <= max(horizon_comparison$Horizon)]
-  
-  cat("=== RMSE at Key Forecast Horizons ===\n")
-  horizon_summary <- horizon_comparison |>
-    filter(Horizon %in% key_horizons) |>
-    select(Horizon, River, RMSE) |>
-    pivot_wider(names_from = River, values_from = RMSE) |>
-    mutate(across(where(is.numeric), ~round(.x, 3)))
-  
-  print(horizon_summary)
-  
-  # Performance degradation
-  cat("\n=== Forecast Degradation (RMSE increase from Step 1) ===\n")
-  degradation <- horizon_comparison |>
-    group_by(River) |>
-    mutate(
-      RMSE_Step1 = first(RMSE),
-      Pct_Increase = round((RMSE - RMSE_Step1) / RMSE_Step1 * 100, 1)
-    ) |>
-    filter(Horizon %in% key_horizons) |>
-    select(Horizon, River, RMSE, Pct_Increase) |>
-    pivot_wider(names_from = River, values_from = c(RMSE, Pct_Increase))
-  
-  print(degradation)
-}
-
-# ----------------------------------------------------------------------------
-# 2. HORIZON RMSE LINE PLOT
-# ----------------------------------------------------------------------------
-
-if (!is.null(IWW_lstm) && !is.null(Miss_lstm)) {
-  
-  p_horizon_rmse <- ggplot(horizon_comparison, aes(x = Horizon, y = RMSE, color = River)) +
-    geom_line(linewidth = 1.2) +
-    geom_point(size = 2) +
-    geom_vline(xintercept = c(7, 14, 30), linetype = "dashed", alpha = 0.5) +
-    annotate("text", x = 7, y = max(horizon_comparison$RMSE) * 0.95, 
-             label = "1 week", hjust = -0.1, size = 3) +
-    annotate("text", x = 14, y = max(horizon_comparison$RMSE) * 0.95, 
-             label = "2 weeks", hjust = -0.1, size = 3) +
-    annotate("text", x = 30, y = max(horizon_comparison$RMSE) * 0.95, 
-             label = "~1 month", hjust = -0.1, size = 3) +
-    scale_color_viridis_d(option = "plasma", end = 0.8) +
-    labs(
-      title = "LSTM Forecast Performance by Horizon",
-      subtitle = "RMSE increases as forecast distance grows",
-      x = "Forecast Horizon (observations ahead)",
-      y = "RMSE (ft/yr)",
-      color = "Dataset"
-    ) +
-    theme_minimal() +
-    theme(legend.position = "bottom")
-  
-  print(p_horizon_rmse)
-  ggsave("./Output/LSTM/Horizon_RMSE_Comparison.png", width = 12, height = 8)
-}
-
-# ----------------------------------------------------------------------------
-# 3. FACETED PREDICTIONS BY HORIZON (River-Level)
-# ----------------------------------------------------------------------------
-
-create_horizon_prediction_plot <- function(lstm_result, dataset_name, horizons_to_plot = c(1, 7, 15, 30, 45)) {
-  
-  if (is.null(lstm_result)) return(NULL)
-  
-  # Filter to available horizons
-  max_horizon <- ncol(lstm_result$predictions$actual)
-  horizons_to_plot <- horizons_to_plot[horizons_to_plot <= max_horizon]
-  
-  # Build data for plotting
-  plot_data <- map_dfr(horizons_to_plot, function(h) {
-    data.frame(
-      Horizon = paste0("Step ", h),
-      Horizon_Num = h,
-      Date = as.Date(lstm_result$predictions$dates),
-      Actual = lstm_result$predictions$actual[, h],
-      Predicted = lstm_result$predictions$predicted[, h]
-    )
-  }) |>
-    mutate(Horizon = factor(Horizon, levels = paste0("Step ", horizons_to_plot)))
-  
-  # Calculate metrics per horizon
-  metrics_data <- plot_data |>
-    group_by(Horizon, Horizon_Num) |>
-    summarise(
-      RMSE = sqrt(mean((Predicted - Actual)^2)),
-      MAE = mean(abs(Predicted - Actual)),
-      R2 = cor(Actual, Predicted)^2,
-      .groups = "drop"
-    ) |>
-    mutate(label = sprintf("RMSE: %.2f\nR²: %.2f", RMSE, R2))
-  
-  # Time series plot
-  p_ts <- plot_data |>
-    pivot_longer(cols = c(Actual, Predicted), names_to = "Type", values_to = "Rate") |>
-    ggplot(aes(x = Date, y = Rate, color = Type)) +
-    geom_line(alpha = 0.7, linewidth = 0.8) +
-    geom_text(data = metrics_data, aes(x = min(plot_data$Date), y = Inf, label = label),
-              hjust = 0, vjust = 1.5, size = 3, inherit.aes = FALSE) +
-    facet_wrap(~Horizon, ncol = 1, scales = "free_y") +
-    scale_color_manual(values = c("Actual" = "#2166AC", "Predicted" = "#D6604D")) +
-    labs(
-      title = paste(dataset_name, "- Predictions at Different Forecast Horizons"),
-      x = "Date",
-      y = "Shoaling Rate (ft/yr)",
-      color = ""
-    ) +
-    theme_minimal() +
-    theme(
-      legend.position = "bottom",
-      strip.text = element_text(face = "bold")
-    )
-  
-  # Scatter plot
-  p_scatter <- plot_data |>
-    ggplot(aes(x = Actual, y = Predicted)) +
-    geom_point(alpha = 0.5, size = 1.5, color = "#4575B4") +
-    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
-    geom_smooth(method = "lm", se = TRUE, color = "#D73027", alpha = 0.2) +
-    facet_wrap(~Horizon, ncol = 3, scales = "fixed") +
-    labs(
-      title = paste(dataset_name, "- Actual vs Predicted by Horizon"),
-      x = "Actual (ft/yr)",
-      y = "Predicted (ft/yr)"
-    ) +
-    theme_minimal() +
-    coord_fixed()
-  
-  return(list(timeseries = p_ts, scatter = p_scatter, metrics = metrics_data))
-}
-
-# Generate plots for each river
-if (!is.null(IWW_lstm)) {
-  iww_horizon_plots <- create_horizon_prediction_plot(IWW_lstm, "Illinois Waterway")
-  print(iww_horizon_plots$timeseries)
-  ggsave("./Output/LSTM/IWW_Horizon_Timeseries.png", width = 14, height = 16)
-  print(iww_horizon_plots$scatter)
-  ggsave("./Output/LSTM/IWW_Horizon_Scatter.png", width = 14, height = 10)
-}
-
-if (!is.null(Miss_lstm)) {
-  miss_horizon_plots <- create_horizon_prediction_plot(Miss_lstm, "Mississippi River")
-  print(miss_horizon_plots$timeseries)
-  ggsave("./Output/LSTM/Miss_Horizon_Timeseries.png", width = 14, height = 16)
-  print(miss_horizon_plots$scatter)
-  ggsave("./Output/LSTM/Miss_Horizon_Scatter.png", width = 14, height = 10)
-}
-
-# ----------------------------------------------------------------------------
-# 4. HEATMAP OF PREDICTIONS ACROSS ALL HORIZONS
-# ----------------------------------------------------------------------------
-
-create_horizon_heatmap <- function(lstm_result, dataset_name) {
-  
-  if (is.null(lstm_result)) return(NULL)
-  
-  # Create matrix of predictions
-  n_test <- nrow(lstm_result$predictions$actual)
-  n_horizon <- ncol(lstm_result$predictions$actual)
-  
-  # Calculate error at each point
-  error_matrix <- lstm_result$predictions$predicted - lstm_result$predictions$actual
-  
-  # Convert to long format
-  error_df <- expand.grid(
-    Sample = 1:n_test,
-    Horizon = 1:n_horizon
-  ) |>
-    mutate(
-      Error = as.vector(error_matrix),
-      Date = rep(as.Date(lstm_result$predictions$dates), n_horizon)
-    )
-  
-  # Heatmap
-  p_heatmap <- ggplot(error_df, aes(x = Horizon, y = Sample, fill = Error)) +
-    geom_tile() +
-    scale_fill_gradient2(
-      low = "#2166AC", mid = "white", high = "#D6604D",
-      midpoint = 0,
-      name = "Prediction\nError (ft/yr)"
-    ) +
-    labs(
-      title = paste(dataset_name, "- Prediction Error Heatmap"),
-      subtitle = "Blue = Under-prediction, Red = Over-prediction",
-      x = "Forecast Horizon",
-      y = "Test Sample"
-    ) +
-    theme_minimal()
-  
-  return(p_heatmap)
-}
-
-if (!is.null(IWW_lstm)) {
-  p_iww_heatmap <- create_horizon_heatmap(IWW_lstm, "Illinois Waterway")
-  print(p_iww_heatmap)
-  ggsave("./Output/LSTM/IWW_Error_Heatmap.png", width = 12, height = 10)
-}
-
-if (!is.null(Miss_lstm)) {
-  p_miss_heatmap <- create_horizon_heatmap(Miss_lstm, "Mississippi River")
-  print(p_miss_heatmap)
-  ggsave("./Output/LSTM/Miss_Error_Heatmap.png", width = 12, height = 10)
-}
-
-# ----------------------------------------------------------------------------
-# 5. WEEKLY FORECAST SUMMARY (if horizon represents ~weekly intervals)
-# ----------------------------------------------------------------------------
-
-cat("\n=== Weekly Forecast Performance Summary ===\n")
-
-if (!is.null(IWW_lstm)) {
-  
-  # Assuming each step is roughly 1 observation, group into weekly bins
-  # Adjust based on your actual temporal spacing
-  weekly_summary <- IWW_lstm$horizon_metrics |>
-    mutate(
-      Week = ceiling(Horizon / 7),
-      Week_Label = paste0("Week ", Week)
-    ) |>
-    group_by(Week, Week_Label) |>
-    summarise(
-      Horizons = paste(min(Horizon), "-", max(Horizon)),
-      Avg_RMSE = round(mean(RMSE), 3),
-      Avg_MAE = round(mean(MAE), 3),
-      .groups = "drop"
-    )
-  
-  cat("\nIllinois Waterway - Weekly Averaged Performance:\n")
-  print(weekly_summary)
-  
-  # Weekly bar plot
-  p_weekly <- weekly_summary |>
-    ggplot(aes(x = Week_Label, y = Avg_RMSE, fill = Avg_RMSE)) +
-    geom_col(alpha = 0.8) +
-    geom_text(aes(label = round(Avg_RMSE, 2)), vjust = -0.5, size = 3) +
-    scale_fill_viridis_c(option = "plasma", direction = -1) +
-    labs(
-      title = "Illinois Waterway - LSTM Performance by Forecast Week",
-      x = "Forecast Week",
-      y = "Average RMSE (ft/yr)"
-    ) +
-    theme_minimal() +
-    theme(legend.position = "none")
-  
-  print(p_weekly)
-  ggsave("./Output/LSTM/IWW_Weekly_RMSE.png", width = 10, height = 6)
-}
-
-if (!is.null(Miss_lstm)) {
-  
-  weekly_summary_miss <- Miss_lstm$horizon_metrics |>
-    mutate(
-      Week = ceiling(Horizon / 7),
-      Week_Label = paste0("Week ", Week)
-    ) |>
-    group_by(Week, Week_Label) |>
-    summarise(
-      Horizons = paste(min(Horizon), "-", max(Horizon)),
-      Avg_RMSE = round(mean(RMSE), 3),
-      Avg_MAE = round(mean(MAE), 3),
-      .groups = "drop"
-    )
-  
-  cat("\nMississippi River - Weekly Averaged Performance:\n")
-  print(weekly_summary_miss)
-  
-  p_weekly_miss <- weekly_summary_miss |>
-    ggplot(aes(x = Week_Label, y = Avg_RMSE, fill = Avg_RMSE)) +
-    geom_col(alpha = 0.8) +
-    geom_text(aes(label = round(Avg_RMSE, 2)), vjust = -0.5, size = 3) +
-    scale_fill_viridis_c(option = "plasma", direction = -1) +
-    labs(
-      title = "Mississippi River - LSTM Performance by Forecast Week",
-      x = "Forecast Week",
-      y = "Average RMSE (ft/yr)"
-    ) +
-    theme_minimal() +
-    theme(legend.position = "none")
-  
-  print(p_weekly_miss)
-  ggsave("./Output/LSTM/Miss_Weekly_RMSE.png", width = 10, height = 6)
-}
-
-# ----------------------------------------------------------------------------
-# 6. COMBINED WEEKLY COMPARISON
-# ----------------------------------------------------------------------------
-
-if (!is.null(IWW_lstm) && !is.null(Miss_lstm)) {
-  
-  # Combine weekly summaries
-  combined_weekly <- bind_rows(
-    IWW_lstm$horizon_metrics |>
-      mutate(Week = ceiling(Horizon / 7), River = "Illinois Waterway"),
-    Miss_lstm$horizon_metrics |>
-      mutate(Week = ceiling(Horizon / 7), River = "Mississippi River")
-  ) |>
-    group_by(Week, River) |>
-    summarise(
-      Avg_RMSE = mean(RMSE),
-      Avg_MAE = mean(MAE),
-      .groups = "drop"
-    ) |>
-    mutate(Week_Label = paste0("Week ", Week))
-  
-  p_combined_weekly <- ggplot(combined_weekly, aes(x = Week_Label, y = Avg_RMSE, fill = River)) +
-    geom_col(position = "dodge", alpha = 0.8) +
-    scale_fill_manual(values = c("Illinois Waterway" = "orange", "Mississippi River" = "dodgerblue")) +
-    labs(
-      title = "LSTM Forecast Performance Comparison by Week",
-      subtitle = "Average RMSE across forecast horizons grouped by week",
-      x = "Forecast Week",
-      y = "Average RMSE (ft/yr)",
-      fill = "River System"
-    ) +
-    theme_minimal() +
-    theme(legend.position = "bottom")
-  
-  print(p_combined_weekly)
-  ggsave("./Output/LSTM/Combined_Weekly_RMSE.png", width = 12, height = 7)
-}
-
-# ----------------------------------------------------------------------------
-# 7. FORECAST CONFIDENCE BANDS
-# ----------------------------------------------------------------------------
-
-create_forecast_confidence_plot <- function(lstm_result, dataset_name) {
-  
-  if (is.null(lstm_result)) return(NULL)
-  
-  # Calculate prediction intervals at each horizon
-  horizon_stats <- data.frame(
-    Horizon = 1:lstm_result$metrics$Forecast_Horizon,
-    RMSE = lstm_result$horizon_metrics$RMSE
-  ) |>
-    mutate(
-      # Approximate 95% confidence interval using RMSE
-      CI_Lower = -1.96 * RMSE,
-      CI_Upper = 1.96 * RMSE
-    )
-  
-  p_confidence <- ggplot(horizon_stats, aes(x = Horizon)) +
-    geom_ribbon(aes(ymin = CI_Lower, ymax = CI_Upper), fill = "steelblue", alpha = 0.3) +
-    geom_line(aes(y = 0), linetype = "dashed", color = "black") +
-    geom_line(aes(y = RMSE), color = "red", linewidth = 1) +
-    geom_line(aes(y = -RMSE), color = "red", linewidth = 1) +
-    labs(
-      title = paste(dataset_name, "- Forecast Uncertainty by Horizon"),
-      subtitle = "Blue band = 95% CI, Red lines = ±1 RMSE",
-      x = "Forecast Horizon (steps ahead)",
-      y = "Expected Error Range (ft/yr)"
-    ) +
-    theme_minimal()
-  
-  return(p_confidence)
-}
-
-if (!is.null(IWW_lstm)) {
-  p_iww_conf <- create_forecast_confidence_plot(IWW_lstm, "Illinois Waterway")
-  print(p_iww_conf)
-  ggsave("./Output/LSTM/IWW_Forecast_Confidence.png", width = 10, height = 6)
-}
-
-if (!is.null(Miss_lstm)) {
-  p_miss_conf <- create_forecast_confidence_plot(Miss_lstm, "Mississippi River")
-  print(p_miss_conf)
-  ggsave("./Output/LSTM/Miss_Forecast_Confidence.png", width = 10, height = 6)
-}
-
-# ----------------------------------------------------------------------------
-# 8. SUMMARY TABLE FOR PAPER
-# ----------------------------------------------------------------------------
-
-cat("\n")
-cat("╔════════════════════════════════════════════════════════════════════════╗\n")
-cat("║              LSTM HORIZON SUMMARY (FOR PAPER)                          ║\n")
-cat("╚════════════════════════════════════════════════════════════════════════╝\n\n")
-
-if (!is.null(IWW_lstm) && !is.null(Miss_lstm)) {
-  
-  paper_summary <- horizon_comparison |>
-    filter(Horizon %in% c(1, 7, 14, 30, max(Horizon))) |>
-    mutate(
-      Horizon_Label = case_when(
-        Horizon == 1 ~ "1-step",
-        Horizon == 7 ~ "1-week",
-        Horizon == 14 ~ "2-week",
-        Horizon == 30 ~ "1-month",
-        TRUE ~ paste0(Horizon, "-step")
-      )
-    ) |>
-    select(Horizon_Label, River, RMSE, MAE) |>
-    mutate(
-      RMSE = round(RMSE, 3),
-      MAE = round(MAE, 3)
-    )
-  
-  cat("Table: LSTM Performance at Key Forecast Horizons\n\n")
-  print(paper_summary |> pivot_wider(names_from = River, values_from = c(RMSE, MAE)))
-  
-  # Save for paper
-  write_csv(paper_summary, "./Output/LSTM/Horizon_Summary_Table.csv")
-  cat("\nSaved to ./Output/LSTM/Horizon_Summary_Table.csv\n")
-}
-```
-
-
 
 # Save Results
 
