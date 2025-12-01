@@ -1381,7 +1381,7 @@ return(lstm_data)
 
 ```{r lstm-model-function}
 # Build LSTM model with batch normalization
-build_lstm_model_improved <- function(sequence_length, n_features, forecast_horizon) {
+build_lstm_model<- function(sequence_length, n_features, forecast_horizon) {
 
   
   model <- keras_model_sequential() |>
