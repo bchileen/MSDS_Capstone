@@ -1,0 +1,13 @@
+Config,N_Features,N_AR_Features,RMSE,MAE,Correlation,Variance_Ratio,Accuracy,Status,River
+No_AR,29,0,1.8781,1.0832,-0.14,0.197,55.3,PROBLEMATIC,Illinois Waterway
+Lag_1_only,30,1,1.6659,0.8395,-0.083,0.014,48.1,PROBLEMATIC,Illinois Waterway
+Lag_1_7,31,2,1.6451,0.8007,-0.002,0.007,54.5,PROBLEMATIC,Illinois Waterway
+Lag_1_7_14,32,3,1.6389,0.7648,0.005,0.002,71.9,PROBLEMATIC,Illinois Waterway
+Lag_1_7_14_30,33,4,1.6505,0.7951,-0.024,0.007,59.7,PROBLEMATIC,Illinois Waterway
+Full_AR,39,10,1.656,0.7806,-0.175,0.002,73.5,PROBLEMATIC,Illinois Waterway
+No_AR,37,0,2.8478,1.5498,0.087,0.032,61.5,PROBLEMATIC,Mississippi River
+Lag_1_only,38,1,2.8447,1.5664,0.069,0.021,56.9,PROBLEMATIC,Mississippi River
+Lag_1_7,39,2,2.8452,1.5327,0.093,0.034,58.3,PROBLEMATIC,Mississippi River
+Lag_1_7_14,40,3,2.8524,1.5132,0.104,0.038,62,PROBLEMATIC,Mississippi River
+Lag_1_7_14_30,41,4,2.8428,1.5456,0.084,0.021,55.6,PROBLEMATIC,Mississippi River
+Full_AR,47,10,2.8252,1.522,0.147,0.05,64.9,PROBLEMATIC,Mississippi River

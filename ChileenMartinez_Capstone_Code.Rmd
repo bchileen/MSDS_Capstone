@@ -673,7 +673,7 @@ filter(river == "IL")|>
   drop_na(any_of(IWW_gages)) 
 
 
-IWW_PCA_data <- IWW_complete|>
+IWW_pca_data <- IWW_complete|>
 select(any_of(IWW_gages)) 
 
 IWW_PCA <- prcomp(IWW_pca_data, scale = TRUE, center = TRUE)
@@ -1271,161 +1271,240 @@ if (!is.null(pool_xgb_metrics)) {
 LSTM Model developed using Claude AI on 11/01/2025. AI was used to build out the data preparation handling and workflow and to build model architecture to correctly handle temporal splits. Other reference materials include [R Bloggers Forecasting Sunspots](https://www.r-bloggers.com/2018/04/time-series-deep-learning-forecasting-sunspots-with-keras-stateful-lstm-in-r/)  and [Time Series Forecasting with RNN](https://blogs.rstudio.com/ai/posts/2017-12-20-time-series-forecasting-with-recurrent-neural-networks/){.uri} and [LSTM Time Series Prediction in R](http://datasideoflife.com/?p=1171)
 
 ## LSTM Data Preparation
-## LSTM Data Preparation Function
-
 ```{r lstm-data-prep-function}
-#' Prepare data for LSTM with proper normalization and sequence creation
-#' 
-#' Key fixes for flat predictions:
-#' 1. Proper min-max scaling of target variable
-#' 2. Correct temporal ordering
-#' 3. No data leakage between train/val/test
-#' 4. Proper 3D tensor creation for Keras
-
-prepare_lstm_data_fixed <- function(data, 
-                                    gages_to_use,
-                                    sequence_length = 30,
-                                    forecast_horizon = 40,
-                                    train_prop = 0.70,
-                                    val_prop = 0.15,
-                                    dataset_name = "Dataset") {
+prepare_lstm_data_autoregressive <- function(data, 
+                                              gages_to_use,
+                                              sequence_length = 30,
+                                              forecast_horizon = 40,
+                                              train_prop = 0.70,
+                                              val_prop = 0.15,
+                                              dataset_name = "Dataset",
+                                              shoaling_lags = c(1, 7, 14, 30),
+                                              include_rolling_stats = TRUE) {
   
-  cat(sprintf("\n=== Preparing LSTM Data: %s ===\n", dataset_name))
+ cat(sprintf("\n%s\n", strrep("=", 70)))
+ cat(sprintf("PREPARING LSTM DATA (AUTOREGRESSIVE): %s\n", dataset_name))
+ cat(sprintf("%s\n", strrep("=", 70)))
   
- # Step 1: Sort by date and select features
-  data <- data |>
-    arrange(SurveyDateBefore) |>
-    filter(!is.na(AnnualShoalingRate_ftperyr))
+ # Step 1: Sort by date and filter
+ data <- data |>
+   arrange(SurveyDateBefore) |>
+   filter(!is.na(AnnualShoalingRate_ftperyr))
   
-  # Identify available gages
-  available_gages <- intersect(gages_to_use, names(data))
+ original_n <- nrow(data)
+ cat(sprintf("  Starting samples: %d\n", original_n))
   
-  if (length(available_gages) < 2) {
-    cat("  ERROR: Insufficient gage columns available\n")
-    return(NULL)
-  }
+ # Identify available gages
+ available_gages <- intersect(gages_to_use, names(data))
   
-  # Step 2: Select and prepare features
-  feature_cols <- c("AnnualShoalingRate_ftperyr", "WeekOfYear", "DaysBetween", available_gages)
-  feature_cols <- intersect(feature_cols, names(data))
+ if (length(available_gages) < 2) {
+   cat("  ERROR: Insufficient gage columns available\n")
+   return(NULL)
+ }
   
-  # Create feature matrix with complete cases only
-  feature_data <- data |>
-    select(all_of(feature_cols), SurveyDateBefore) |>
-    drop_na()
+ cat(sprintf("  Available gages: %d of %d requested\n", 
+             length(available_gages), length(gages_to_use)))
   
-  n_samples <- nrow(feature_data)
-  min_required <- sequence_length + forecast_horizon + 50
+ # =========================================================================
+ # STEP 2: CREATE AUTOREGRESSIVE FEATURES (KEY ADDITION - ARA APPROACH)
+ # This is what makes the model work - past shoaling predicts future shoaling
+ # =========================================================================
   
-  if (n_samples < min_required) {
-    cat(sprintf("  ERROR: Insufficient samples (%d < %d required)\n", n_samples, min_required))
-    return(NULL)
-  }
+ cat("\n  Creating autoregressive shoaling features...\n")
   
-  cat(sprintf("  Samples: %d, Features: %d, Gages: %d\n", 
-              n_samples, length(feature_cols) - 1, length(available_gages)))
+ ar_feature_cols <- c()
   
-  # Step 3: Extract target and features
-  target <- feature_data$AnnualShoalingRate_ftperyr
-  dates <- feature_data$SurveyDateBefore
+ # Create lagged shoaling rates
+ if (length(shoaling_lags) > 0) {
+   for (lag in shoaling_lags) {
+     lag_col <- paste0("shoaling_lag_", lag)
+     data[[lag_col]] <- dplyr::lag(data$AnnualShoalingRate_ftperyr, lag)
+     ar_feature_cols <- c(ar_feature_cols, lag_col)
+     cat(sprintf("    + %s (lag %d observations)\n", lag_col, lag))
+   }
+ }
   
-  features <- feature_data |>
-    select(-SurveyDateBefore) |>
-    as.matrix()
-  
-  # Step 4: CRITICAL - Proper normalization (key fix for flat predictions)
-  n <- nrow(features)
-  train_end <- floor(n * train_prop)
-  val_end <- floor(n * (train_prop + val_prop))
-  
-  # Calculate scaling parameters from training data only (prevents data leakage)
-  train_features <- features[1:train_end, ]
-  
-  # Feature scaling parameters
-  feature_means <- colMeans(train_features, na.rm = TRUE)
-  feature_sds <- apply(train_features, 2, sd, na.rm = TRUE)
-  feature_sds[feature_sds == 0] <- 1  # Prevent division by zero
-  
-  # Target scaling parameters (very important for LSTM)
-  target_mean <- mean(target[1:train_end], na.rm = TRUE)
-  target_sd <- sd(target[1:train_end], na.rm = TRUE)
-  if (target_sd == 0) target_sd <- 1
-  
-  # Apply normalization to ALL data using TRAINING parameters
-  features_scaled <- scale(features, center = feature_means, scale = feature_sds)
-  target_scaled <- (target - target_mean) / target_sd
-  
-  cat(sprintf("  Target mean: %.3f, sd: %.3f\n", target_mean, target_sd))
-  cat(sprintf("  Scaled target range: [%.3f, %.3f]\n", 
-              min(target_scaled), max(target_scaled)))
-  
-  # Step 5: Create sequences for LSTM
-  create_sequences <- function(features, target, seq_len, horizon) {
-    n <- nrow(features)
-    n_sequences <- n - seq_len - horizon + 1
+ # Create rolling statistics if requested
+ if (include_rolling_stats) {
+   data <- data |>
+     mutate(
+       # 7-day rolling mean of shoaling
+       shoaling_roll_mean_7 = zoo::rollmean(AnnualShoalingRate_ftperyr, 7, 
+                                             fill = NA, align = "right"),
+       # 7-day rolling standard deviation (volatility)
+       shoaling_roll_sd_7 = zoo::rollapply(AnnualShoalingRate_ftperyr, 7, 
+                                            sd, fill = NA, align = "right"),
+       # 14-day rolling mean
+       shoaling_roll_mean_14 = zoo::rollmean(AnnualShoalingRate_ftperyr, 14, 
+                                              fill = NA, align = "right"),
+       # Trend: change from 7 days ago
+       shoaling_trend_7 = AnnualShoalingRate_ftperyr - 
+                          dplyr::lag(AnnualShoalingRate_ftperyr, 7),
+       # Trend: change from 14 days ago  
+       shoaling_trend_14 = AnnualShoalingRate_ftperyr - 
+                           dplyr::lag(AnnualShoalingRate_ftperyr, 14),
+       # Acceleration: is the trend increasing or decreasing?
+       shoaling_accel = shoaling_trend_7 - dplyr::lag(shoaling_trend_7, 7)
+     )
     
-    if (n_sequences <= 0) {
-      return(list(X = NULL, y = NULL, dates = NULL))
-    }
+   rolling_cols <- c("shoaling_roll_mean_7", "shoaling_roll_sd_7",
+                     "shoaling_roll_mean_14", "shoaling_trend_7", 
+                     "shoaling_trend_14", "shoaling_accel")
+   ar_feature_cols <- c(ar_feature_cols, rolling_cols)
     
-    n_features <- ncol(features)
+   cat(sprintf("    + Rolling statistics: %s\n", paste(rolling_cols, collapse = ", ")))
+ }
+  
+ cat(sprintf("  Total autoregressive features: %d\n", length(ar_feature_cols)))
+  
+ # Step 3: Select all features (gages + time + autoregressive)
+ feature_cols <- c("AnnualShoalingRate_ftperyr", "WeekOfYear", "DaysBetween", 
+                   available_gages, ar_feature_cols)
+ feature_cols <- intersect(feature_cols, names(data))
+  
+ # Create feature matrix with complete cases only
+ # (NAs from lagging will be removed here)
+ feature_data <- data |>
+   select(all_of(feature_cols), SurveyDateBefore) |>
+   drop_na()
+  
+ n_samples <- nrow(feature_data)
+ samples_lost <- original_n - n_samples
+  
+ cat(sprintf("\n  Samples after AR feature creation: %d (lost %d to lagging/NAs)\n",
+             n_samples, samples_lost))
+  
+ min_required <- sequence_length + forecast_horizon + 50
+  
+ if (n_samples < min_required) {
+   cat(sprintf("  ERROR: Insufficient samples (%d < %d required)\n", 
+               n_samples, min_required))
+   return(NULL)
+ }
+  
+ # Summary of features
+ n_gage_features <- length(available_gages)
+ n_time_features <- sum(c("WeekOfYear", "DaysBetween") %in% feature_cols)
+ n_ar_features <- length(ar_feature_cols)
+ n_total_features <- length(feature_cols) - 1  # -1 for target
+  
+ cat(sprintf("\n  Feature breakdown:\n"))
+ cat(sprintf("    Gage features: %d\n", n_gage_features))
+ cat(sprintf("    Time features: %d\n", n_time_features))
+ cat(sprintf("    Autoregressive features: %d\n", n_ar_features))
+ cat(sprintf("    TOTAL input features: %d\n", n_total_features))
+  
+ # Step 4: Extract target and features
+ target <- feature_data$AnnualShoalingRate_ftperyr
+ dates <- feature_data$SurveyDateBefore
+  
+ features <- feature_data |>
+   select(-SurveyDateBefore) |>
+   as.matrix()
+  
+ # Step 5: CRITICAL - Proper normalization (from training data only)
+ n <- nrow(features)
+ train_end <- floor(n * train_prop)
+ val_end <- floor(n * (train_prop + val_prop))
+  
+ # Calculate scaling parameters from training data only (prevents data leakage)
+ train_features <- features[1:train_end, ]
+  
+ feature_means <- colMeans(train_features, na.rm = TRUE)
+ feature_sds <- apply(train_features, 2, sd, na.rm = TRUE)
+ feature_sds[feature_sds == 0] <- 1  # Prevent division by zero
+  
+ # Target scaling parameters
+ target_mean <- mean(target[1:train_end], na.rm = TRUE)
+ target_sd <- sd(target[1:train_end], na.rm = TRUE)
+ if (target_sd == 0) target_sd <- 1
+  
+ # Apply normalization to ALL data using TRAINING parameters
+ features_scaled <- scale(features, center = feature_means, scale = feature_sds)
+ target_scaled <- (target - target_mean) / target_sd
+  
+ cat(sprintf("\n  Scaling parameters (from training data):\n"))
+ cat(sprintf("    Target mean: %.3f, sd: %.3f\n", target_mean, target_sd))
+ cat(sprintf("    Scaled target range: [%.3f, %.3f]\n", 
+             min(target_scaled), max(target_scaled)))
+  
+ # Step 6: Create sequences for LSTM
+ create_sequences <- function(features, target, seq_len, horizon) {
+   n <- nrow(features)
+   n_sequences <- n - seq_len - horizon + 1
     
-    # Initialize arrays
-    X <- array(0, dim = c(n_sequences, seq_len, n_features))
-    y <- matrix(0, nrow = n_sequences, ncol = horizon)
-    seq_dates <- vector("list", n_sequences)
+   if (n_sequences <= 0) {
+     return(list(X = NULL, y = NULL, dates = NULL))
+   }
     
-    for (i in 1:n_sequences) {
-      X[i, , ] <- features[i:(i + seq_len - 1), ]
-      y[i, ] <- target[(i + seq_len):(i + seq_len + horizon - 1)]
-      seq_dates[[i]] <- dates[i + seq_len]
-    }
+   n_features <- ncol(features)
     
-    return(list(X = X, y = y, dates = unlist(seq_dates)))
-  }
+   # Initialize arrays
+   X <- array(0, dim = c(n_sequences, seq_len, n_features))
+   y <- matrix(0, nrow = n_sequences, ncol = horizon)
+   seq_dates <- vector("list", n_sequences)
+    
+   for (i in 1:n_sequences) {
+     X[i, , ] <- features[i:(i + seq_len - 1), ]
+     y[i, ] <- target[(i + seq_len):(i + seq_len + horizon - 1)]
+     seq_dates[[i]] <- dates[i + seq_len]
+   }
+    
+   return(list(X = X, y = y, dates = unlist(seq_dates)))
+ }
   
-  sequences <- create_sequences(features_scaled, target_scaled, 
-                                sequence_length, forecast_horizon)
+ sequences <- create_sequences(features_scaled, target_scaled, 
+                               sequence_length, forecast_horizon)
   
-  if (is.null(sequences$X)) {
-    cat("  ERROR: Failed to create sequences\n")
-    return(NULL)
-  }
+ if (is.null(sequences$X)) {
+   cat("  ERROR: Failed to create sequences\n")
+   return(NULL)
+ }
   
-  n_sequences <- dim(sequences$X)[1]
-  cat(sprintf("  Created %d sequences\n", n_sequences))
+ n_sequences <- dim(sequences$X)[1]
+ cat(sprintf("\n  Created %d sequences (length=%d, horizon=%d)\n", 
+             n_sequences, sequence_length, forecast_horizon))
   
-  # Step 6: Temporal split (no shuffling - maintain time order)
-  train_seq_end <- floor(n_sequences * train_prop)
-  val_seq_end <- floor(n_sequences * (train_prop + val_prop))
+ # Step 7: Temporal split (no shuffling - maintain time order)
+ train_seq_end <- floor(n_sequences * train_prop)
+ val_seq_end <- floor(n_sequences * (train_prop + val_prop))
   
-  X_train <- sequences$X[1:train_seq_end, , , drop = FALSE]
-  y_train <- sequences$y[1:train_seq_end, , drop = FALSE]
-  dates_train <- sequences$dates[1:train_seq_end]
+ X_train <- sequences$X[1:train_seq_end, , , drop = FALSE]
+ y_train <- sequences$y[1:train_seq_end, , drop = FALSE]
+ dates_train <- sequences$dates[1:train_seq_end]
   
-  X_val <- sequences$X[(train_seq_end + 1):val_seq_end, , , drop = FALSE]
-  y_val <- sequences$y[(train_seq_end + 1):val_seq_end, , drop = FALSE]
-  dates_val <- sequences$dates[(train_seq_end + 1):val_seq_end]
+ X_val <- sequences$X[(train_seq_end + 1):val_seq_end, , , drop = FALSE]
+ y_val <- sequences$y[(train_seq_end + 1):val_seq_end, , drop = FALSE]
+ dates_val <- sequences$dates[(train_seq_end + 1):val_seq_end]
   
-  X_test <- sequences$X[(val_seq_end + 1):n_sequences, , , drop = FALSE]
-  y_test <- sequences$y[(val_seq_end + 1):n_sequences, , drop = FALSE]
-  dates_test <- sequences$dates[(val_seq_end + 1):n_sequences]
+ X_test <- sequences$X[(val_seq_end + 1):n_sequences, , , drop = FALSE]
+ y_test <- sequences$y[(val_seq_end + 1):n_sequences, , drop = FALSE]
+ dates_test <- sequences$dates[(val_seq_end + 1):n_sequences]
   
-  cat(sprintf("  Train: %d, Val: %d, Test: %d sequences\n",
-              nrow(X_train), nrow(X_val), nrow(X_test)))
+ cat(sprintf("\n  Data splits:\n"))
+ cat(sprintf("    Train: %d sequences (%.0f%%)\n", nrow(X_train), train_prop * 100))
+ cat(sprintf("    Val:   %d sequences (%.0f%%)\n", nrow(X_val), val_prop * 100))
+ cat(sprintf("    Test:  %d sequences (%.0f%%)\n", nrow(X_test), (1-train_prop-val_prop) * 100))
   
-  return(list(
-    X_train = X_train, y_train = y_train,
-    X_val = X_val, y_val = y_val,
-    X_test = X_test, y_test = y_test,
-    dates_train = dates_train, dates_val = dates_val, dates_test = dates_test,
-    target_mean = target_mean, target_sd = target_sd,
-    feature_means = feature_means, feature_sds = feature_sds,
-    sequence_length = sequence_length, forecast_horizon = forecast_horizon,
-    n_features = ncol(features), n_train = nrow(X_train),
-    n_val = nrow(X_val), n_test = nrow(X_test),
-    feature_names = colnames(features), dataset_name = dataset_name
-  ))
+ cat(sprintf("\n  Tensor shapes:\n"))
+ cat(sprintf("    X_train: [%d, %d, %d]\n", dim(X_train)[1], dim(X_train)[2], dim(X_train)[3]))
+ cat(sprintf("    y_train: [%d, %d]\n", dim(y_train)[1], dim(y_train)[2]))
+  
+ return(list(
+   X_train = X_train, y_train = y_train,
+   X_val = X_val, y_val = y_val,
+   X_test = X_test, y_test = y_test,
+   dates_train = dates_train, dates_val = dates_val, dates_test = dates_test,
+   target_mean = target_mean, target_sd = target_sd,
+   feature_means = feature_means, feature_sds = feature_sds,
+   sequence_length = sequence_length, forecast_horizon = forecast_horizon,
+   n_features = ncol(features), n_train = nrow(X_train),
+   n_val = nrow(X_val), n_test = nrow(X_test),
+   feature_names = colnames(features),
+   ar_features = ar_feature_cols,
+   gage_features = available_gages,
+   dataset_name = dataset_name
+ ))
 }
 ```
 
@@ -1438,207 +1517,367 @@ prepare_lstm_data_fixed <- function(data,
 #' 1. Multiple LSTM layers with proper hidden sizes
 #' 2. Batch normalization for training stability
 #' 3. Dropout for regularization
-#' 4. Huber loss (more robust than MSE for outliers)
+#' 4. MSE loss
+
+#' Build LSTM model with architecture designed to leverage autoregressive features
+#' 
+#' Architecture notes:
+#' - Multiple LSTM layers to capture complex temporal patterns
+#' - Batch normalization for training stability
+#' - Dropout for regularization (prevents overfitting to AR features)
+#' - L2 regularization on kernels
+#' - Linear output for regression
 
 build_lstm_model <- function(sequence_length,
-                             n_features,
-                             forecast_horizon,
-                             lstm_units = c(128, 64, 32),
-                             dropout_rate = 0.2,
-                             learning_rate = 0.001) {
-  
-  cat(sprintf("\nBuilding LSTM: input=(%d, %d), output=%d\n",
-              sequence_length, n_features, forecast_horizon))
-  
-  keras3::clear_session()
-  
-  inputs <- layer_input(shape = c(sequence_length, n_features))
-  
-  # First LSTM layer
-  x <- inputs |>
-    layer_lstm(units = lstm_units[1], return_sequences = TRUE,
-               kernel_regularizer = regularizer_l2(0.001),
-               recurrent_regularizer = regularizer_l2(0.001)) |>
-    layer_batch_normalization() |>
-    layer_dropout(rate = dropout_rate)
-  
-  # Second LSTM layer
-  if (length(lstm_units) >= 2) {
-    x <- x |>
-      layer_lstm(units = lstm_units[2], return_sequences = TRUE,
-                 kernel_regularizer = regularizer_l2(0.001)) |>
-      layer_batch_normalization() |>
-      layer_dropout(rate = dropout_rate)
-  }
-  
-  # Third LSTM layer (final)
-  if (length(lstm_units) >= 3) {
-    x <- x |>
-      layer_lstm(units = lstm_units[3], return_sequences = FALSE,
-                 kernel_regularizer = regularizer_l2(0.001)) |>
-      layer_batch_normalization() |>
-      layer_dropout(rate = dropout_rate / 2)
-  } else {
-    x <- x |>
-      layer_lstm(units = lstm_units[length(lstm_units)], return_sequences = FALSE)
-  }
-  
-  # Dense layers
-  x <- x |>
-    layer_dense(units = 64, activation = "relu") |>
-    layer_dropout(rate = dropout_rate / 2) |>
-    layer_dense(units = 32, activation = "relu")
-  
-  # Output layer
-  outputs <- x |>
-    layer_dense(units = forecast_horizon, activation = "linear")
-  
-  model <- keras_model(inputs = inputs, outputs = outputs)
-  
-  model |> compile(
-    optimizer = optimizer_adam(learning_rate = learning_rate),
-    loss = loss_huber(),
-    metrics = list(metric_mean_absolute_error(), metric_root_mean_squared_error())
-  )
-  
-  return(model)
+                            n_features,
+                            forecast_horizon,
+                            lstm_units = c(128, 64, 32),
+                            dropout_rate = 0.2,
+                            learning_rate = 0.001) {
+ 
+ cat(sprintf("\nBuilding LSTM model:\n"))
+ cat(sprintf("  Input shape: (%d timesteps, %d features)\n", sequence_length, n_features))
+ cat(sprintf("  Output shape: %d predictions\n", forecast_horizon))
+ cat(sprintf("  LSTM units: %s\n", paste(lstm_units, collapse = " → ")))
+ cat(sprintf("  Dropout rate: %.2f\n", dropout_rate))
+ cat(sprintf("  Learning rate: %.4f\n", learning_rate))
+ 
+ keras3::clear_session()
+ 
+ inputs <- layer_input(shape = c(sequence_length, n_features))
+ 
+ # First LSTM layer - return sequences for stacking
+ x <- inputs |>
+   layer_lstm(units = lstm_units[1], 
+              return_sequences = TRUE,
+              kernel_regularizer = regularizer_l2(0.001),
+              recurrent_regularizer = regularizer_l2(0.001)) |>
+   layer_batch_normalization() |>
+   layer_dropout(rate = dropout_rate)
+ 
+ # Second LSTM layer
+ if (length(lstm_units) >= 2) {
+   x <- x |>
+     layer_lstm(units = lstm_units[2], 
+                return_sequences = TRUE,
+                kernel_regularizer = regularizer_l2(0.001)) |>
+     layer_batch_normalization() |>
+     layer_dropout(rate = dropout_rate)
+ }
+ 
+ # Third/Final LSTM layer - return_sequences = FALSE for final
+ if (length(lstm_units) >= 3) {
+   x <- x |>
+     layer_lstm(units = lstm_units[3], 
+                return_sequences = FALSE,
+                kernel_regularizer = regularizer_l2(0.001)) |>
+     layer_batch_normalization() |>
+     layer_dropout(rate = dropout_rate / 2)
+ } else {
+   x <- x |>
+     layer_lstm(units = lstm_units[length(lstm_units)], 
+                return_sequences = FALSE)
+ }
+ 
+ # Dense layers for final processing
+ x <- x |>
+   layer_dense(units = 64, activation = "relu") |>
+   layer_dropout(rate = dropout_rate / 2) |>
+   layer_dense(units = 32, activation = "relu")
+ 
+ # Output layer - linear activation for regression
+ outputs <- x |>
+   layer_dense(units = forecast_horizon, activation = "linear")
+ 
+ model <- keras_model(inputs = inputs, outputs = outputs)
+ 
+ model |> compile(
+   optimizer = optimizer_adam(learning_rate = learning_rate),
+   loss = 'mean_squared_error',
+   metrics = list(metric_mean_absolute_error(), metric_root_mean_squared_error())
+ )
+ 
+ 
+ return(model)
 }
 ```
 
-## Multi-Lookback Window Testing Function
+## Training model at river level
+```{r}
+#' Train LSTM with autoregressive features + comprehensive evaluation
+#' 
+#' This function:
+#' 1. Trains the LSTM model with early stopping
+#' 2. Evaluates on validation and test sets
+#' 3. Computes metrics at multiple forecast horizons
+#' 4. Runs diagnostic checks for regression-to-mean
+#' 5. Computes binary classification metrics
 
-```{r lstm-lookback-testing}
-#' Test multiple lookback windows to find optimal sequence length
-
-test_lookback_windows <- function(data,
-                                   gages_to_use,
-                                   lookback_windows = c(7, 14, 30, 60),
-                                   forecast_horizon = 40,
-                                   threshold,
-                                   epochs = 75,
-                                   patience = 15,
-                                   dataset_name = "Dataset") {
-  
-  cat(sprintf("\n%s\n", strrep("=", 70)))
-  cat(sprintf("TESTING LOOKBACK WINDOWS: %s\n", dataset_name))
-  cat(sprintf("Windows to test: %s\n", paste(lookback_windows, collapse = ", ")))
-  cat(sprintf("%s\n\n", strrep("=", 70)))
-  
-  results <- list()
-  
-  for (lookback in lookback_windows) {
-    cat(sprintf("\n--- Testing lookback = %d days ---\n", lookback))
-    
-    lstm_data <- prepare_lstm_data_fixed(
-      data = data, gages_to_use = gages_to_use,
-      sequence_length = lookback, forecast_horizon = forecast_horizon,
-      dataset_name = paste(dataset_name, "LB", lookback)
-    )
-    
-    if (is.null(lstm_data)) {
-      cat(sprintf("  Skipping lookback=%d - insufficient data\n", lookback))
-      results[[as.character(lookback)]] <- list(
-        lookback = lookback, status = "insufficient_data", metrics = NULL
-      )
-      next
-    }
-    
-    model <- build_lstm_model(
-      sequence_length = lookback, n_features = lstm_data$n_features,
-      forecast_horizon = forecast_horizon, lstm_units = c(128, 64, 32)
-    )
-    
-    callbacks <- list(
-      callback_early_stopping(monitor = "val_loss", patience = patience,
-                              restore_best_weights = TRUE, verbose = 1),
-      callback_reduce_lr_on_plateau(monitor = "val_loss", factor = 0.5,
-                                    patience = 8, min_lr = 1e-6, verbose = 1)
-    )
-    
-    batch_size <- min(32, max(8, floor(lstm_data$n_train / 10)))
-    
-    start_time <- Sys.time()
-    history <- model |> fit(
-      x = lstm_data$X_train, y = lstm_data$y_train,
-      validation_data = list(lstm_data$X_val, lstm_data$y_val),
-      epochs = epochs, batch_size = batch_size,
-      callbacks = callbacks, verbose = 0
-    )
-    train_time <- difftime(Sys.time(), start_time, units = "mins")
-    
-    # Predictions and inverse transform
-    val_pred_scaled <- predict(model, lstm_data$X_val)
-    test_pred_scaled <- predict(model, lstm_data$X_test)
-    
-    val_pred <- val_pred_scaled * lstm_data$target_sd + lstm_data$target_mean
-    test_pred <- test_pred_scaled * lstm_data$target_sd + lstm_data$target_mean
-    val_actual <- lstm_data$y_val * lstm_data$target_sd + lstm_data$target_mean
-    test_actual <- lstm_data$y_test * lstm_data$target_sd + lstm_data$target_mean
-    
-    # Metrics
-    horizon_metrics <- data.frame(
-      horizon = 1:forecast_horizon,
-      val_rmse = sapply(1:forecast_horizon, function(h) sqrt(mean((val_pred[, h] - val_actual[, h])^2))),
-      test_rmse = sapply(1:forecast_horizon, function(h) sqrt(mean((test_pred[, h] - test_actual[, h])^2)))
-    )
-    
-    val_rmse_all <- sqrt(mean((val_pred - val_actual)^2))
-    test_rmse_all <- sqrt(mean((test_pred - test_actual)^2))
-    test_rmse_1step <- sqrt(mean((test_pred[, 1] - test_actual[, 1])^2))
-    
-    # Classification
-    actual_class <- ifelse(test_actual[, 1] > threshold, "YES", "NO")
-    pred_class <- ifelse(test_pred[, 1] > threshold, "YES", "NO")
-    accuracy <- mean(actual_class == pred_class)
-    
-    TP <- sum(actual_class == "YES" & pred_class == "YES")
-    FP <- sum(actual_class == "NO" & pred_class == "YES")
-    FN <- sum(actual_class == "YES" & pred_class == "NO")
-    TN <- sum(actual_class == "NO" & pred_class == "NO")
-    
-    precision <- ifelse((TP + FP) > 0, TP / (TP + FP), NA)
-    recall <- ifelse((TP + FN) > 0, TP / (TP + FN), NA)
-    f1 <- ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
-                 2 * precision * recall / (precision + recall), NA)
-    
-    cat(sprintf("\n  Lookback %d: Test RMSE=%.4f, Accuracy=%.1f%%, F1=%.3f\n",
-                lookback, test_rmse_all, accuracy * 100, f1))
-    
-    results[[as.character(lookback)]] <- list(
-      lookback = lookback, status = "success", model = model,
-      history = history, lstm_data = lstm_data, train_time = train_time,
-      val_predictions = list(actual = val_actual, predicted = val_pred),
-      test_predictions = list(actual = test_actual, predicted = test_pred,
-                              dates = lstm_data$dates_test),
-      horizon_metrics = horizon_metrics,
-      summary_metrics = data.frame(
-        lookback = lookback, val_rmse = val_rmse_all, test_rmse = test_rmse_all,
-        test_rmse_1step = test_rmse_1step, accuracy = accuracy,
-        precision = precision, recall = recall, f1 = f1
-      ),
-      confusion = table(Actual = actual_class, Predicted = pred_class)
-    )
-  }
-  
-  # Compare
-  comparison <- do.call(rbind, lapply(results, function(x) {
-    if (!is.null(x$summary_metrics)) x$summary_metrics else NULL
-  }))
-  
-  if (!is.null(comparison) && nrow(comparison) > 0) {
-    cat("\n=== LOOKBACK WINDOW COMPARISON ===\n")
-    print(comparison |> arrange(test_rmse))
-    best <- comparison |> slice_min(test_rmse, n = 1)
-    cat(sprintf("\nBest lookback: %d days (Test RMSE: %.4f)\n", best$lookback, best$test_rmse))
-  }
-  
-  return(list(
-    results = results, comparison = comparison,
-    best_lookback = if (!is.null(comparison)) comparison$lookback[which.min(comparison$test_rmse)] else NA,
-    dataset_name = dataset_name
-  ))
+train_lstm_comprehensive <- function(lstm_data,
+                                     dataset_name,
+                                     threshold,
+                                     epochs = 100,
+                                     batch_size = 32,
+                                     patience = 20,
+                                     lstm_units = c(128, 64, 32),
+                                     learning_rate = 0.001) {
+ 
+ if (is.null(lstm_data)) {
+   cat(sprintf("ERROR: No data provided for %s\n", dataset_name))
+   return(NULL)
+ }
+ 
+ cat(sprintf("\n%s\n", strrep("=", 70)))
+ cat(sprintf("TRAINING LSTM: %s\n", dataset_name))
+ cat(sprintf("%s\n", strrep("=", 70)))
+ cat(sprintf("  Sequence length: %d\n", lstm_data$sequence_length))
+ cat(sprintf("  Forecast horizon: %d\n", lstm_data$forecast_horizon))
+ cat(sprintf("  Features: %d (including %d autoregressive)\n", 
+             lstm_data$n_features, length(lstm_data$ar_features)))
+ cat(sprintf("  Training samples: %d\n", lstm_data$n_train))
+ cat(sprintf("  Threshold for classification: %.2f\n", threshold))
+ 
+ # Build model
+ model <- build_lstm_model(
+   sequence_length = lstm_data$sequence_length,
+   n_features = lstm_data$n_features,
+   forecast_horizon = lstm_data$forecast_horizon,
+   lstm_units = lstm_units,
+   learning_rate = learning_rate
+ )
+ 
+ # Callbacks
+ callbacks <- list(
+   callback_early_stopping(
+     monitor = "val_loss",
+     patience = patience,
+     restore_best_weights = TRUE,
+     verbose = 1
+   ),
+   callback_reduce_lr_on_plateau(
+     monitor = "val_loss",
+     factor = 0.5,
+     patience = ceiling(patience / 2),
+     min_lr = 1e-6,
+     verbose = 1
+   )
+ )
+ 
+ # Adjust batch size if needed
+ batch_size <- min(batch_size, max(8, floor(lstm_data$n_train / 4)))
+ cat(sprintf("  Batch size: %d\n", batch_size))
+ 
+ # Train
+ cat("\nTraining...\n")
+ start_time <- Sys.time()
+ 
+ history <- model |> fit(
+   x = lstm_data$X_train,
+   y = lstm_data$y_train,
+   validation_data = list(lstm_data$X_val, lstm_data$y_val),
+   epochs = epochs,
+   batch_size = batch_size,
+   callbacks = callbacks,
+   verbose = 1
+ )
+ 
+ training_time <- difftime(Sys.time(), start_time, units = "mins")
+ cat(sprintf("\nTraining completed in %.1f minutes\n", as.numeric(training_time)))
+ cat(sprintf("  Final epoch: %d\n", length(history$metrics$loss)))
+ cat(sprintf("  Best val_loss: %.4f\n", min(history$metrics$val_loss)))
+ 
+ # =========================================================================
+ # PREDICTIONS
+ # =========================================================================
+ 
+ cat("\nGenerating predictions...\n")
+ 
+ # Validation predictions
+ val_pred_scaled <- predict(model, lstm_data$X_val)
+ val_pred <- val_pred_scaled * lstm_data$target_sd + lstm_data$target_mean
+ val_actual <- lstm_data$y_val * lstm_data$target_sd + lstm_data$target_mean
+ 
+ # Test predictions
+ test_pred_scaled <- predict(model, lstm_data$X_test)
+ test_pred <- test_pred_scaled * lstm_data$target_sd + lstm_data$target_mean
+ test_actual <- lstm_data$y_test * lstm_data$target_sd + lstm_data$target_mean
+ 
+ # =========================================================================
+ # DIAGNOSTICS - Check for regression-to-mean
+ # =========================================================================
+ 
+ cat("\n")
+ diagnostics <- diagnose_lstm_predictions(
+   actual = test_actual[, 1],
+   predicted = test_pred[, 1],
+   dataset_name = dataset_name
+ )
+ 
+ # =========================================================================
+ # HORIZON-SPECIFIC METRICS
+ # =========================================================================
+ 
+ horizon_metrics <- data.frame(
+   horizon_day = 1:lstm_data$forecast_horizon,
+   val_rmse = sapply(1:lstm_data$forecast_horizon, function(h) {
+     sqrt(mean((val_pred[, h] - val_actual[, h])^2))
+   }),
+   val_mae = sapply(1:lstm_data$forecast_horizon, function(h) {
+     mean(abs(val_pred[, h] - val_actual[, h]))
+   }),
+   test_rmse = sapply(1:lstm_data$forecast_horizon, function(h) {
+     sqrt(mean((test_pred[, h] - test_actual[, h])^2))
+   }),
+   test_mae = sapply(1:lstm_data$forecast_horizon, function(h) {
+     mean(abs(test_pred[, h] - test_actual[, h]))
+   }),
+   test_correlation = sapply(1:lstm_data$forecast_horizon, function(h) {
+     cor(test_pred[, h], test_actual[, h])
+   })
+ )
+ 
+ # Overall metrics
+ val_rmse_all <- sqrt(mean((val_pred - val_actual)^2))
+ val_mae_all <- mean(abs(val_pred - val_actual))
+ test_rmse_all <- sqrt(mean((test_pred - test_actual)^2))
+ test_mae_all <- mean(abs(test_pred - test_actual))
+ 
+ # 1-step metrics (most reliable)
+ test_rmse_1step <- horizon_metrics$test_rmse[1]
+ test_mae_1step <- horizon_metrics$test_mae[1]
+ test_cor_1step <- horizon_metrics$test_correlation[1]
+ 
+ # Intermediate horizons
+ intermediate_days <- c(1, 7, 14, 21, 30, 40)
+ intermediate_days <- intermediate_days[intermediate_days <= lstm_data$forecast_horizon]
+ 
+ intermediate_metrics <- horizon_metrics |>
+   filter(horizon_day %in% intermediate_days) |>
+   select(horizon_day, test_rmse, test_mae, test_correlation)
+ 
+ cat("\nIntermediate Horizon Metrics:\n")
+ print(intermediate_metrics)
+ 
+ # =========================================================================
+ # CLASSIFICATION METRICS
+ # =========================================================================
+ 
+ classification_results <- lapply(intermediate_days, function(h) {
+   actual_class <- ifelse(test_actual[, h] > threshold, "YES", "NO")
+   pred_class <- ifelse(test_pred[, h] > threshold, "YES", "NO")
+   
+   TP <- sum(actual_class == "YES" & pred_class == "YES")
+   FP <- sum(actual_class == "NO" & pred_class == "YES")
+   FN <- sum(actual_class == "YES" & pred_class == "NO")
+   TN <- sum(actual_class == "NO" & pred_class == "NO")
+   
+   accuracy <- (TP + TN) / (TP + FP + FN + TN)
+   precision <- ifelse((TP + FP) > 0, TP / (TP + FP), NA)
+   recall <- ifelse((TP + FN) > 0, TP / (TP + FN), NA)
+   f1 <- ifelse(!is.na(precision) & !is.na(recall) & (precision + recall) > 0,
+                2 * precision * recall / (precision + recall), NA)
+   
+   data.frame(
+     horizon = h,
+     accuracy = accuracy,
+     precision = precision,
+     recall = recall,
+     f1 = f1,
+     TP = TP, FP = FP, FN = FN, TN = TN
+   )
+ })
+ 
+ classification_df <- do.call(rbind, classification_results)
+ 
+ cat("\nClassification Results by Horizon:\n")
+ print(classification_df |> select(horizon, accuracy, precision, recall, f1) |>
+         mutate(across(where(is.numeric), ~round(., 3))))
+ 
+ # =========================================================================
+ # SUMMARY METRICS
+ # =========================================================================
+ 
+ summary_metrics <- data.frame(
+   Dataset = dataset_name,
+   Model = "LSTM_AR",
+   Sequence_Length = lstm_data$sequence_length,
+   Forecast_Horizon = lstm_data$forecast_horizon,
+   N_Features = lstm_data$n_features,
+   N_AR_Features = length(lstm_data$ar_features),
+   Val_RMSE = val_rmse_all,
+   Val_MAE = val_mae_all,
+   Test_RMSE_All = test_rmse_all,
+   Test_MAE_All = test_mae_all,
+   Test_RMSE_1Step = test_rmse_1step,
+   Test_MAE_1Step = test_mae_1step,
+   Test_Correlation_1Step = test_cor_1step,
+   Variance_Ratio = diagnostics$variance_ratio,
+   Accuracy_1Step = classification_df$accuracy[1],
+   Precision_1Step = classification_df$precision[1],
+   Recall_1Step = classification_df$recall[1],
+   F1_1Step = classification_df$f1[1],
+   Diagnostic_Status = diagnostics$overall_status,
+   Training_Time_Min = as.numeric(training_time)
+ )
+ 
+ cat("\n")
+ cat(strrep("=", 60), "\n")
+ cat("SUMMARY\n")
+ cat(strrep("=", 60), "\n")
+ cat(sprintf("  Validation RMSE: %.4f\n", val_rmse_all))
+ cat(sprintf("  Test RMSE (all horizons): %.4f\n", test_rmse_all))
+ cat(sprintf("  Test RMSE (1-step): %.4f\n", test_rmse_1step))
+ cat(sprintf("  Test Correlation (1-step): %.3f\n", test_cor_1step))
+ cat(sprintf("  Variance Ratio: %.3f [%s]\n", diagnostics$variance_ratio, 
+             diagnostics$var_status))
+ cat(sprintf("  Classification Accuracy (1-step): %.1f%%\n", 
+             classification_df$accuracy[1] * 100))
+ cat(sprintf("  F1 Score (1-step): %.3f\n", classification_df$f1[1]))
+ cat(sprintf("  Diagnostic Status: %s\n", diagnostics$overall_status))
+ cat(strrep("=", 60), "\n")
+ 
+ # =========================================================================
+ # RETURN RESULTS
+ # =========================================================================
+ 
+ return(list(
+   model = model,
+   history = history,
+   dataset_name = dataset_name,
+   training_time = training_time,
+   predictions = list(
+     val_actual = val_actual,
+     val_predicted = val_pred,
+     test_actual = test_actual,
+     test_predicted = test_pred,
+     dates_val = lstm_data$dates_val,
+     dates_test = lstm_data$dates_test
+   ),
+   summary_metrics = summary_metrics,
+   horizon_metrics = horizon_metrics,
+   intermediate_metrics = intermediate_metrics,
+   classification_metrics = classification_df,
+   diagnostics = diagnostics,
+   scalers = list(
+     target_mean = lstm_data$target_mean,
+     target_sd = lstm_data$target_sd
+   ),
+   confusion_1step = table(
+     Actual = ifelse(test_actual[, 1] > threshold, "YES", "NO"),
+     Predicted = ifelse(test_pred[, 1] > threshold, "YES", "NO")
+   ),
+   ar_features = lstm_data$ar_features,
+   lstm_data_summary = list(
+     n_train = lstm_data$n_train,
+     n_val = lstm_data$n_val,
+     n_test = lstm_data$n_test,
+     feature_names = lstm_data$feature_names
+   )
+ ))
 }
 ```
+
+
 
 ## Comprehensive LSTM Training Function
 
@@ -1795,468 +2034,1042 @@ train_lstm_comprehensive <- function(lstm_data,
 ## LSTM Validation Plots Function
 
 ```{r lstm-validation-plots}
-#' Create comprehensive validation plots
+#' Create comprehensive validation plots for LSTM results
+#' Includes diagnostic plots to verify autoregressive approach is working
 
 create_lstm_validation_plots <- function(lstm_result, output_dir = "./Output/LSTM") {
-  
-  if (is.null(lstm_result)) return(NULL)
-  
-  dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
-  
-  dataset_name <- lstm_result$dataset_name
-  preds <- lstm_result$predictions
-  plots <- list()
-  
-  # 1. Validation time series
-  val_df <- data.frame(
-    date = as.Date(preds$dates_val),
-    actual = preds$val_actual[, 1],
-    predicted = preds$val_predicted[, 1]
-  ) |> pivot_longer(cols = c(actual, predicted), names_to = "type", values_to = "value")
-  
-  plots$val_timeseries <- ggplot(val_df, aes(x = date, y = value, color = type)) +
-    geom_line(linewidth = 0.8, alpha = 0.8) +
-    geom_point(size = 1.5, alpha = 0.6) +
-    scale_color_manual(values = c("actual" = "#2166AC", "predicted" = "#D6604D"),
-                       labels = c("Actual", "Predicted")) +
-    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
-    labs(title = paste(dataset_name, "- Validation Set (1-Step Ahead)"),
-         x = "Date", y = "Shoaling Rate (ft/yr)", color = "") +
-    theme_minimal() + theme(legend.position = "bottom")
-  
-  # 2. Test time series
-  test_df <- data.frame(
-    date = as.Date(preds$dates_test),
-    actual = preds$test_actual[, 1],
-    predicted = preds$test_predicted[, 1]
-  ) |> pivot_longer(cols = c(actual, predicted), names_to = "type", values_to = "value")
-  
-  plots$test_timeseries <- ggplot(test_df, aes(x = date, y = value, color = type)) +
-    geom_line(linewidth = 0.8, alpha = 0.8) +
-    geom_point(size = 1.5, alpha = 0.6) +
-    scale_color_manual(values = c("actual" = "#2166AC", "predicted" = "#D6604D"),
-                       labels = c("Actual", "Predicted")) +
-    geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
-    labs(title = paste(dataset_name, "- Test Set Predictions (1-Step Ahead)"),
-         x = "Date", y = "Shoaling Rate (ft/yr)", color = "") +
-    theme_minimal() + theme(legend.position = "bottom")
-  
-  ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_test_timeseries.png")),
-         plots$test_timeseries, width = 12, height = 6)
-  
-  # 3. Scatter plot
-  scatter_df <- data.frame(actual = preds$test_actual[, 1], predicted = preds$test_predicted[, 1])
-  rmse <- sqrt(mean((scatter_df$predicted - scatter_df$actual)^2))
-  r2 <- cor(scatter_df$actual, scatter_df$predicted)^2
-  
-  plots$scatter <- ggplot(scatter_df, aes(x = actual, y = predicted)) +
-    geom_point(alpha = 0.6, size = 2.5, color = "#4575B4") +
-    geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red", linewidth = 1) +
-    geom_smooth(method = "lm", se = TRUE, color = "#D73027", fill = "#D73027", alpha = 0.2) +
-    labs(title = paste(dataset_name, "- Predicted vs Actual"),
-         subtitle = sprintf("RMSE: %.3f | R²: %.3f", rmse, r2),
-         x = "Actual (ft/yr)", y = "Predicted (ft/yr)") +
-    theme_minimal()
-  
-  ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_scatter.png")),
-         plots$scatter, width = 8, height = 8)
-  
-  # 4. Horizon degradation
-  horizon_df <- lstm_result$horizon_metrics
-  
-  plots$horizon <- ggplot(horizon_df, aes(x = horizon_day)) +
-    geom_line(aes(y = test_rmse, color = "Test"), linewidth = 1.2) +
-    geom_line(aes(y = val_rmse, color = "Validation"), linewidth = 1.2, linetype = "dashed") +
-    geom_point(aes(y = test_rmse, color = "Test"), size = 2) +
-    scale_color_manual(values = c("Test" = "#D6604D", "Validation" = "#2166AC")) +
-    labs(title = paste(dataset_name, "- RMSE by Forecast Horizon"),
-         x = "Forecast Horizon (days)", y = "RMSE (ft/yr)", color = "") +
-    theme_minimal() + theme(legend.position = "bottom")
-  
-  ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_horizon.png")),
-         plots$horizon, width = 10, height = 6)
-  
-  # 5. Classification by horizon
-  class_df <- lstm_result$classification_metrics
-  if (!is.null(class_df) && nrow(class_df) > 0) {
-    class_long <- class_df |>
-      select(horizon, accuracy, precision, recall, f1) |>
-      pivot_longer(cols = c(accuracy, precision, recall, f1), names_to = "metric", values_to = "value")
-    
-    plots$classification <- ggplot(class_long, aes(x = horizon, y = value, color = metric)) +
-      geom_line(linewidth = 1.2) + geom_point(size = 3) +
-      scale_color_viridis_d() +
-      scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
-      labs(title = paste(dataset_name, "- Classification by Horizon"),
-           x = "Forecast Horizon (days)", y = "Score", color = "Metric") +
-      theme_minimal() + theme(legend.position = "bottom")
-    
-    ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_classification.png")),
-           plots$classification, width = 10, height = 6)
-  }
-  
-  # Combined summary
-  plots$summary <- (plots$test_timeseries + plots$scatter) / (plots$horizon + plots$classification) +
-    plot_annotation(title = paste(dataset_name, "- LSTM Model Summary"))
-  
-  ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_summary.png")),
-         plots$summary, width = 16, height = 14)
-  
-  cat(sprintf("\nPlots saved to %s\n", output_dir))
-  return(plots)
+ 
+ if (is.null(lstm_result)) {
+   cat("No results to plot\n")
+   return(NULL)
+ }
+ 
+ dir.create(output_dir, showWarnings = FALSE, recursive = TRUE)
+ 
+ dataset_name <- lstm_result$dataset_name
+ preds <- lstm_result$predictions
+ diag <- lstm_result$diagnostics
+ 
+ plots <- list()
+ 
+ # =========================================================================
+ # 1. Test Time Series - Actual vs Predicted
+ # =========================================================================
+ 
+ test_df <- data.frame(
+   date = as.Date(preds$dates_test),
+   actual = preds$test_actual[, 1],
+   predicted = preds$test_predicted[, 1]
+ ) |>
+   pivot_longer(cols = c(actual, predicted), 
+                names_to = "type", values_to = "value")
+ 
+ plots$test_timeseries <- ggplot(test_df, aes(x = date, y = value, color = type)) +
+   geom_line(linewidth = 0.8, alpha = 0.8) +
+   geom_point(size = 1.5, alpha = 0.6) +
+   scale_color_manual(
+     values = c("actual" = "#2166AC", "predicted" = "#D6604D"),
+     labels = c("Actual", "Predicted")
+   ) +
+   geom_hline(yintercept = 0, linetype = "dashed", color = "gray50") +
+   labs(
+     title = paste(dataset_name, "- Test Set Predictions (1-Step Ahead)"),
+     subtitle = sprintf("RMSE: %.3f | Correlation: %.3f | Variance Ratio: %.3f",
+                        diag$rmse, diag$correlation, diag$variance_ratio),
+     x = "Date",
+     y = "Shoaling Rate (ft/yr)",
+     color = ""
+   ) +
+   theme_minimal() +
+   theme(legend.position = "bottom")
+ 
+ ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_test_timeseries.png")),
+        plots$test_timeseries, width = 14, height = 6)
+ 
+ # =========================================================================
+ # 2. Scatter Plot with Perfect Prediction Line
+ # =========================================================================
+ 
+ scatter_df <- data.frame(
+   actual = preds$test_actual[, 1],
+   predicted = preds$test_predicted[, 1]
+ )
+ 
+ plots$scatter <- ggplot(scatter_df, aes(x = actual, y = predicted)) +
+   geom_point(alpha = 0.6, size = 2.5, color = "#4575B4") +
+   geom_abline(intercept = 0, slope = 1, linetype = "dashed", 
+               color = "red", linewidth = 1) +
+   geom_smooth(method = "lm", se = TRUE, color = "#D73027", 
+               fill = "#D73027", alpha = 0.2) +
+   labs(
+     title = paste(dataset_name, "- Predicted vs Actual"),
+     subtitle = sprintf("R²: %.3f | Variance Ratio: %.3f [%s]",
+                        diag$correlation^2, diag$variance_ratio, diag$var_status),
+     x = "Actual (ft/yr)",
+     y = "Predicted (ft/yr)"
+   ) +
+   theme_minimal() +
+   coord_fixed()
+ 
+ ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_scatter.png")),
+        plots$scatter, width = 8, height = 8)
+ 
+ # =========================================================================
+ # 3. Variance Comparison - KEY DIAGNOSTIC PLOT
+ # =========================================================================
+ 
+ var_df <- data.frame(
+   Type = c("Actual", "Predicted"),
+   Variance = c(diag$actual_var, diag$pred_var)
+ )
+ 
+ plots$variance <- ggplot(var_df, aes(x = Type, y = Variance, fill = Type)) +
+   geom_col(alpha = 0.8, width = 0.6) +
+   geom_text(aes(label = sprintf("%.3f", Variance)), vjust = -0.5, size = 4) +
+   scale_fill_manual(values = c("Actual" = "#2166AC", "Predicted" = "#D6604D")) +
+   labs(
+     title = paste(dataset_name, "- Variance Comparison"),
+     subtitle = sprintf("Ratio: %.3f (Healthy: 0.8-1.2) | Status: %s",
+                        diag$variance_ratio, diag$var_status),
+     x = "",
+     y = "Variance"
+   ) +
+   theme_minimal() +
+   theme(legend.position = "none")
+ 
+ ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_variance.png")),
+        plots$variance, width = 6, height = 6)
+ 
+ # =========================================================================
+ # 4. Horizon Performance Degradation
+ # =========================================================================
+ 
+ horizon_df <- lstm_result$horizon_metrics
+ 
+ plots$horizon_rmse <- ggplot(horizon_df, aes(x = horizon_day)) +
+   geom_line(aes(y = test_rmse), color = "#D6604D", linewidth = 1.2) +
+   geom_point(aes(y = test_rmse), color = "#D6604D", size = 2) +
+   geom_line(aes(y = val_rmse), color = "#2166AC", linewidth = 1, linetype = "dashed") +
+   geom_vline(xintercept = c(7, 14, 21, 30), linetype = "dotted", alpha = 0.5) +
+   labs(
+     title = paste(dataset_name, "- RMSE by Forecast Horizon"),
+     subtitle = "Solid = Test, Dashed = Validation",
+     x = "Forecast Horizon (days ahead)",
+     y = "RMSE (ft/yr)"
+   ) +
+   theme_minimal()
+ 
+ plots$horizon_cor <- ggplot(horizon_df, aes(x = horizon_day, y = test_correlation)) +
+   geom_line(color = "#4575B4", linewidth = 1.2) +
+   geom_point(color = "#4575B4", size = 2) +
+   geom_hline(yintercept = 0.3, linetype = "dashed", color = "orange") +
+   geom_hline(yintercept = 0.5, linetype = "dashed", color = "green") +
+   labs(
+     title = paste(dataset_name, "- Correlation by Forecast Horizon"),
+     subtitle = "Green: Good (0.5), Orange: Minimum (0.3)",
+     x = "Forecast Horizon (days ahead)",
+     y = "Correlation"
+   ) +
+   theme_minimal()
+ 
+ horizon_combined <- plots$horizon_rmse + plots$horizon_cor
+ ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_horizon.png")),
+        horizon_combined, width = 14, height = 6)
+ 
+ # =========================================================================
+ # 5. Classification Performance by Horizon
+ # =========================================================================
+ 
+ class_df <- lstm_result$classification_metrics
+ if (!is.null(class_df) && nrow(class_df) > 0) {
+   
+   class_long <- class_df |>
+     select(horizon, accuracy, precision, recall, f1) |>
+     pivot_longer(cols = c(accuracy, precision, recall, f1),
+                  names_to = "metric", values_to = "value")
+   
+   plots$classification <- ggplot(class_long, aes(x = horizon, y = value, color = metric)) +
+     geom_line(linewidth = 1.2) +
+     geom_point(size = 3) +
+     scale_color_viridis_d() +
+     scale_y_continuous(limits = c(0, 1), labels = scales::percent) +
+     geom_hline(yintercept = 0.5, linetype = "dashed", alpha = 0.5) +
+     labs(
+       title = paste(dataset_name, "- Classification Metrics by Horizon"),
+       subtitle = "Dashed line = 50% (random baseline)",
+       x = "Forecast Horizon (days ahead)",
+       y = "Score",
+       color = "Metric"
+     ) +
+     theme_minimal() +
+     theme(legend.position = "bottom")
+   
+   ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_classification.png")),
+          plots$classification, width = 10, height = 6)
+ }
+ 
+ # =========================================================================
+ # 6. Residuals Analysis
+ # =========================================================================
+ 
+ residuals_df <- data.frame(
+   date = as.Date(preds$dates_test),
+   residual = preds$test_actual[, 1] - preds$test_predicted[, 1],
+   predicted = preds$test_predicted[, 1]
+ )
+ 
+ plots$residuals_time <- ggplot(residuals_df, aes(x = date, y = residual)) +
+   geom_line(alpha = 0.6, color = "#4575B4") +
+   geom_point(size = 1, alpha = 0.6) +
+   geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+   geom_smooth(method = "loess", se = TRUE, color = "orange") +
+   labs(
+     title = paste(dataset_name, "- Residuals Over Time"),
+     subtitle = "Look for patterns (should be random around zero)",
+     x = "Date",
+     y = "Residual (Actual - Predicted)"
+   ) +
+   theme_minimal()
+ 
+ plots$residuals_fitted <- ggplot(residuals_df, aes(x = predicted, y = residual)) +
+   geom_point(alpha = 0.6, color = "#4575B4") +
+   geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+   geom_smooth(method = "loess", se = TRUE, color = "orange") +
+   labs(
+     title = paste(dataset_name, "- Residuals vs Fitted"),
+     subtitle = "Look for heteroscedasticity",
+     x = "Predicted Value",
+     y = "Residual"
+   ) +
+   theme_minimal()
+ 
+ residuals_combined <- plots$residuals_time + plots$residuals_fitted
+ ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_residuals.png")),
+        residuals_combined, width = 14, height = 6)
+ 
+ # =========================================================================
+ # 7. Summary Dashboard
+ # =========================================================================
+ 
+ plots$summary <- (plots$test_timeseries) /
+   (plots$scatter + plots$variance) /
+   (plots$horizon_rmse + plots$horizon_cor) +
+   plot_annotation(
+     title = paste(dataset_name, "- LSTM Model Summary (Autoregressive)"),
+     subtitle = sprintf("Diagnostic Status: %s | AR Features: %d",
+                        diag$overall_status, length(lstm_result$ar_features))
+   )
+ 
+ ggsave(file.path(output_dir, paste0(gsub(" ", "_", dataset_name), "_summary.png")),
+        plots$summary, width = 16, height = 18)
+ 
+ cat(sprintf("\nPlots saved to %s\n", output_dir))
+ 
+ return(plots)
 }
 ```
 
-## Pool-Level LSTM Function
-
-```{r lstm-pool-function}
-#' Train LSTM for a specific pool
-
-train_pool_lstm_fixed <- function(data, pool_name, river_code, pool_gage_mapping,
-                                  threshold, sequence_length = 30, forecast_horizon = 40,
-                                  min_samples = 150, epochs = 75, patience = 15) {
-  
-  key <- paste(river_code, pool_name, sep = "_")
-  
-  if (!key %in% names(pool_gage_mapping)) {
-    return(list(pool = pool_name, river = river_code, status = "no_mapping", metrics = NULL))
-  }
-  
-  pool_map <- pool_gage_mapping[[key]]
-  river_filter <- pool_map$river_filter
-  selected_gages <- pool_map$selected_gages
-  
-  pool_data <- data |>
-    filter(pool == pool_name, river == river_filter) |>
-    arrange(SurveyDateBefore)
-  
-  min_required <- sequence_length + forecast_horizon + 50
-  
-  if (nrow(pool_data) < max(min_samples, min_required)) {
-    return(list(pool = pool_name, river = river_code, status = "insufficient_samples",
-                n = nrow(pool_data), metrics = NULL))
-  }
-  
-  cat(sprintf("\n--- LSTM Pool %s (%s): %d samples ---\n", pool_name, river_code, nrow(pool_data)))
-  
-  lstm_data <- prepare_lstm_data_fixed(
-    data = pool_data, gages_to_use = selected_gages,
-    sequence_length = sequence_length, forecast_horizon = forecast_horizon,
-    dataset_name = paste("Pool", pool_name)
-  )
-  
-  if (is.null(lstm_data)) {
-    return(list(pool = pool_name, river = river_code, status = "data_prep_failed", metrics = NULL))
-  }
-  
-  lstm_result <- tryCatch({
-    train_lstm_comprehensive(
-      lstm_data = lstm_data, dataset_name = paste("Pool", pool_name),
-      threshold = threshold, epochs = epochs,
-      batch_size = min(32, floor(lstm_data$n_train / 4)), patience = patience
-    )
-  }, error = function(e) {
-    cat(sprintf("  LSTM training error: %s\n", e$message))
-    return(NULL)
-  })
-  
-  if (is.null(lstm_result)) {
-    return(list(pool = pool_name, river = river_code, status = "training_failed", metrics = NULL))
-  }
-  
-  lstm_result$pool <- pool_name
-  lstm_result$river <- river_code
-  lstm_result$status <- "success"
-  lstm_result$n_samples <- nrow(pool_data)
-  lstm_result$summary_metrics$Pool <- pool_name
-  lstm_result$summary_metrics$River <- river_code
-  lstm_result$summary_metrics$N_Samples <- nrow(pool_data)
-  
-  return(lstm_result)
+## Test autoregressive functions
+```{r}
+test_ar_configurations <- function(data, 
+                                   gages_to_use, 
+                                   threshold, 
+                                   dataset_name,
+                                   sequence_length = 30,
+                                   forecast_horizon = 40,
+                                   epochs = 50,
+                                   patience = 10) {
+ 
+ cat(sprintf("\n%s\n", strrep("=", 70)))
+ cat(sprintf("TESTING AUTOREGRESSIVE CONFIGURATIONS: %s\n", dataset_name))
+ cat(sprintf("%s\n\n", strrep("=", 70)))
+ 
+ # Define configurations to test
+ configs <- list(
+   "No_AR" = list(lags = c(), rolling = FALSE),
+   "Lag_1_only" = list(lags = c(1), rolling = FALSE),
+   "Lag_1_7" = list(lags = c(1, 7), rolling = FALSE),
+   "Lag_1_7_14" = list(lags = c(1, 7, 14), rolling = FALSE),
+   "Lag_1_7_14_30" = list(lags = c(1, 7, 14, 30), rolling = FALSE),
+   "Full_AR" = list(lags = c(1, 7, 14, 30), rolling = TRUE)
+ )
+ 
+ results <- list()
+ 
+ for (config_name in names(configs)) {
+   cat(sprintf("\n--- Testing: %s ---\n", config_name))
+   
+   config <- configs[[config_name]]
+   
+   # Prepare data
+   lstm_data <- tryCatch({
+     prepare_lstm_data_autoregressive(
+       data = data,
+       gages_to_use = gages_to_use,
+       sequence_length = sequence_length,
+       forecast_horizon = forecast_horizon,
+       dataset_name = paste(dataset_name, config_name),
+       shoaling_lags = config$lags,
+       include_rolling_stats = config$rolling
+     )
+   }, error = function(e) {
+     cat(sprintf("  Data prep error: %s\n", e$message))
+     NULL
+   })
+   
+   if (is.null(lstm_data)) {
+     results[[config_name]] <- list(
+       config = config_name,
+       status = "data_prep_failed",
+       metrics = NULL
+     )
+     next
+   }
+   
+   # Build and train model (quick training for comparison)
+   model <- tryCatch({
+     build_lstm_model(
+       sequence_length = lstm_data$sequence_length,
+       n_features = lstm_data$n_features,
+       forecast_horizon = forecast_horizon,
+       lstm_units = c(64, 32),  # Smaller for speed
+       learning_rate = 0.001
+     )
+   }, error = function(e) {
+     cat(sprintf("  Model build error: %s\n", e$message))
+     NULL
+   })
+   
+   if (is.null(model)) {
+     results[[config_name]] <- list(
+       config = config_name,
+       status = "model_build_failed",
+       metrics = NULL
+     )
+     next
+   }
+   
+   # Train
+   history <- tryCatch({
+     model |> fit(
+       x = lstm_data$X_train,
+       y = lstm_data$y_train,
+       validation_data = list(lstm_data$X_val, lstm_data$y_val),
+       epochs = epochs,
+       batch_size = min(32, floor(lstm_data$n_train / 4)),
+       callbacks = list(
+         callback_early_stopping(monitor = "val_loss", patience = patience,
+                                 restore_best_weights = TRUE, verbose = 0)
+       ),
+       verbose = 0
+     )
+   }, error = function(e) {
+     cat(sprintf("  Training error: %s\n", e$message))
+     NULL
+   })
+   
+   if (is.null(history)) {
+     results[[config_name]] <- list(
+       config = config_name,
+       status = "training_failed",
+       metrics = NULL
+     )
+     next
+   }
+   
+   # Evaluate
+   test_pred_scaled <- predict(model, lstm_data$X_test)
+   test_pred <- test_pred_scaled * lstm_data$target_sd + lstm_data$target_mean
+   test_actual <- lstm_data$y_test * lstm_data$target_sd + lstm_data$target_mean
+   
+   # Key metrics
+   pred_1step <- test_pred[, 1]
+   actual_1step <- test_actual[, 1]
+   
+   rmse <- sqrt(mean((pred_1step - actual_1step)^2))
+   mae <- mean(abs(pred_1step - actual_1step))
+   correlation <- cor(pred_1step, actual_1step)
+   variance_ratio <- var(pred_1step) / var(actual_1step)
+   
+   # Classification
+   actual_class <- ifelse(actual_1step > threshold, "YES", "NO")
+   pred_class <- ifelse(pred_1step > threshold, "YES", "NO")
+   accuracy <- mean(actual_class == pred_class)
+   
+   cat(sprintf("  Results: RMSE=%.3f, Cor=%.3f, VarRatio=%.3f, Acc=%.1f%%\n",
+               rmse, correlation, variance_ratio, accuracy * 100))
+   
+   results[[config_name]] <- list(
+     config = config_name,
+     status = "success",
+     n_features = lstm_data$n_features,
+     n_ar_features = length(lstm_data$ar_features),
+     rmse = rmse,
+     mae = mae,
+     correlation = correlation,
+     variance_ratio = variance_ratio,
+     accuracy = accuracy,
+     epochs_run = length(history$metrics$loss)
+   )
+   
+   # Clean up
+   rm(model, lstm_data)
+   keras3::clear_session()
+   gc()
+ }
+ 
+ # Compile comparison
+ comparison <- do.call(rbind, lapply(results, function(x) {
+   if (x$status == "success") {
+     data.frame(
+       Config = x$config,
+       N_Features = x$n_features,
+       N_AR_Features = x$n_ar_features,
+       RMSE = round(x$rmse, 4),
+       MAE = round(x$mae, 4),
+       Correlation = round(x$correlation, 3),
+       Variance_Ratio = round(x$variance_ratio, 3),
+       Accuracy = round(x$accuracy * 100, 1),
+       Status = ifelse(x$variance_ratio >= 0.5 & x$correlation >= 0.3, 
+                       "HEALTHY", "PROBLEMATIC")
+     )
+   } else {
+     data.frame(
+       Config = x$config,
+       N_Features = NA,
+       N_AR_Features = NA,
+       RMSE = NA,
+       MAE = NA,
+       Correlation = NA,
+       Variance_Ratio = NA,
+       Accuracy = NA,
+       Status = x$status
+     )
+   }
+ }))
+ 
+ cat("\n")
+ cat(strrep("=", 70), "\n")
+ cat("AUTOREGRESSIVE CONFIGURATION COMPARISON\n")
+ cat(strrep("=", 70), "\n")
+ print(comparison |> arrange(desc(Variance_Ratio)))
+ 
+ # Find best configuration
+ healthy_configs <- comparison |> filter(Status == "HEALTHY")
+ if (nrow(healthy_configs) > 0) {
+   best_config <- healthy_configs |> slice_min(RMSE, n = 1)
+   cat(sprintf("\nBest healthy configuration: %s\n", best_config$Config))
+   cat(sprintf("  RMSE: %.4f, Correlation: %.3f, Variance Ratio: %.3f\n",
+               best_config$RMSE, best_config$Correlation, best_config$Variance_Ratio))
+ } else {
+   cat("\nWARNING: No healthy configurations found. Consider:\n")
+   cat("  - Using more autoregressive lags\n")
+   cat("  - Reducing forecast horizon\n")
+   cat("  - Simpler model architecture\n")
+ }
+ 
+ return(list(
+   results = results,
+   comparison = comparison,
+   best_config = if(nrow(healthy_configs) > 0) best_config$Config else "Full_AR",
+   dataset_name = dataset_name
+ ))
 }
-```
-
-## Test Lookback Windows - River Level
-
-```{r test-lookback-windows}
-cat("\n### TESTING MULTIPLE LOOKBACK WINDOWS ###\n")
-
-# Test lookback windows for Illinois Waterway
-IWW_lookback_results <- test_lookback_windows(
-  data = IWW_data,
-  gages_to_use = IWW_gages,
-  lookback_windows = c(7, 14, 30, 60),
-  forecast_horizon = 40,
-  threshold = IWW_thresh,
-  epochs = 75,
-  dataset_name = "Illinois Waterway"
-)
-
-# Test lookback windows for Mississippi River
-Miss_lookback_results <- test_lookback_windows(
-  data = Miss_data,
-  gages_to_use = Miss_gages,
-  lookback_windows = c(7, 14, 30, 60),
-  forecast_horizon = 40,
-  threshold = Miss_thresh,
-  epochs = 75,
-  dataset_name = "Mississippi River"
-)
-
-# Save lookback comparison
-lookback_comparison <- bind_rows(
-  IWW_lookback_results$comparison |> mutate(River = "Illinois Waterway"),
-  Miss_lookback_results$comparison |> mutate(River = "Mississippi River")
-)
-
-write_csv(lookback_comparison, "./Output/LSTM/Lookback_Comparison.csv")
-
-cat("\n=== OPTIMAL LOOKBACK WINDOWS ===\n")
-cat(sprintf("Illinois Waterway: %d days\n", IWW_lookback_results$best_lookback))
-cat(sprintf("Mississippi River: %d days\n", Miss_lookback_results$best_lookback))
 ```
 
 ## Train River-Level LSTM Models
 
 ```{r train-lstm-river-models}
-# Get optimal lookback or use default
-iww_best_lb <- ifelse(!is.na(IWW_lookback_results$best_lookback), 
-                      IWW_lookback_results$best_lookback, 30)
-miss_best_lb <- ifelse(!is.na(Miss_lookback_results$best_lookback),
-                       Miss_lookback_results$best_lookback, 30)
+cat("\n")
+cat(strrep("#", 70), "\n")
+cat("# TRAINING RIVER-LEVEL LSTM MODELS WITH AUTOREGRESSIVE FEATURES\n")
+cat(strrep("#", 70), "\n")
 
-cat(sprintf("\nTraining with optimal lookbacks - IWW: %d, Miss: %d\n", iww_best_lb, miss_best_lb))
+# ============================================================================
+# STEP 1: Test autoregressive configurations
+# ============================================================================
+
+cat("\n### STEP 1: Testing Autoregressive Configurations ###\n")
+
+IWW_ar_test <- test_ar_configurations(
+ data = IWW_data,
+ gages_to_use = IWW_gages,
+ threshold = IWW_thresh,
+ dataset_name = "Illinois Waterway",
+ sequence_length = 30,
+ forecast_horizon = 40,
+ epochs = 50,
+ patience = 10
+)
+
+Miss_ar_test <- test_ar_configurations(
+ data = Miss_data,
+ gages_to_use = Miss_gages,
+ threshold = Miss_thresh,
+ dataset_name = "Mississippi River",
+ sequence_length = 30,
+ forecast_horizon = 40,
+ epochs = 50,
+ patience = 10
+)
+
+# Save AR configuration comparison
+ar_comparison <- bind_rows(
+ IWW_ar_test$comparison |> mutate(River = "Illinois Waterway"),
+ Miss_ar_test$comparison |> mutate(River = "Mississippi River")
+)
+write_csv(ar_comparison, "./Output/LSTM/AR_Configuration_Comparison.csv")
+
+cat("\n### AR Configuration Comparison Saved ###\n")
+
+# ============================================================================
+# STEP 2: Train full models with best/default configuration
+# ============================================================================
+
+cat("\n### STEP 2: Training Full LSTM Models ###\n")
+
+# Use Full_AR configuration (most robust based on ARA approach)
+# Or use best_config from testing if available
 
 # Illinois Waterway
-IWW_lstm_data <- prepare_lstm_data_fixed(
-  data = IWW_data,
-  gages_to_use = IWW_gages,
-  sequence_length = iww_best_lb,
-  forecast_horizon = 40,
-  dataset_name = "Illinois Waterway"
+cat("\n--- Training Illinois Waterway LSTM ---\n")
+
+IWW_lstm_data <- prepare_lstm_data_autoregressive(
+ data = IWW_data,
+ gages_to_use = IWW_gages,
+ sequence_length = 30,
+ forecast_horizon = 40,
+ dataset_name = "Illinois Waterway",
+ shoaling_lags = c(1, 7, 14, 30),
+ include_rolling_stats = TRUE
 )
 
 IWW_lstm <- train_lstm_comprehensive(
-  lstm_data = IWW_lstm_data,
-  dataset_name = "Illinois Waterway",
-  threshold = IWW_thresh,
-  epochs = 100,
-  patience = 20
+ lstm_data = IWW_lstm_data,
+ dataset_name = "Illinois Waterway",
+ threshold = IWW_thresh,
+ epochs = 100,
+ batch_size = 32,
+ patience = 20,
+ lstm_units = c(128, 64, 32),
+ learning_rate = 0.001
 )
 
 # Mississippi River
-Miss_lstm_data <- prepare_lstm_data_fixed(
-  data = Miss_data,
-  gages_to_use = Miss_gages,
-  sequence_length = miss_best_lb,
-  forecast_horizon = 40,
-  dataset_name = "Mississippi River"
+cat("\n--- Training Mississippi River LSTM ---\n")
+
+Miss_lstm_data <- prepare_lstm_data_autoregressive(
+ data = Miss_data,
+ gages_to_use = Miss_gages,
+ sequence_length = 30,
+ forecast_horizon = 40,
+ dataset_name = "Mississippi River",
+ shoaling_lags = c(1, 7, 14, 30),
+ include_rolling_stats = TRUE
 )
 
 Miss_lstm <- train_lstm_comprehensive(
-  lstm_data = Miss_lstm_data,
-  dataset_name = "Mississippi River",
-  threshold = Miss_thresh,
-  epochs = 100,
-  patience = 20
+ lstm_data = Miss_lstm_data,
+ dataset_name = "Mississippi River",
+ threshold = Miss_thresh,
+ epochs = 100,
+ batch_size = 32,
+ patience = 20,
+ lstm_units = c(128, 64, 32),
+ learning_rate = 0.001
 )
 
 # Combined
-Combined_lstm_data <- prepare_lstm_data_fixed(
-  data = gage_CSAT_joined,
-  gages_to_use = All_gages,
-  sequence_length = 30,
-  forecast_horizon = 40,
-  dataset_name = "Combined"
+cat("\n--- Training Combined LSTM ---\n")
+
+Combined_lstm_data <- prepare_lstm_data_autoregressive(
+ data = gage_CSAT_joined,
+ gages_to_use = All_gages,
+ sequence_length = 30,
+ forecast_horizon = 40,
+ dataset_name = "Combined",
+ shoaling_lags = c(1, 7, 14, 30),
+ include_rolling_stats = TRUE
 )
 
 Combined_lstm <- train_lstm_comprehensive(
-  lstm_data = Combined_lstm_data,
-  dataset_name = "Combined",
-  threshold = comb_thresh,
-  epochs = 100,
-  patience = 20
+ lstm_data = Combined_lstm_data,
+ dataset_name = "Combined",
+ threshold = comb_thresh,
+ epochs = 100,
+ batch_size = 32,
+ patience = 20,
+ lstm_units = c(128, 64, 32),
+ learning_rate = 0.001
 )
 ```
 
-## Generate LSTM Validation Plots
+## Generate River LSTM Validation Plots
 
 ```{r lstm-generate-plots, fig.height=14, fig.width=16}
-# Generate validation plots
+cat("\n### Generating Validation Plots ###\n")
+
+# Generate plots for each model
 IWW_lstm_plots <- create_lstm_validation_plots(IWW_lstm, "./Output/LSTM/IWW")
 Miss_lstm_plots <- create_lstm_validation_plots(Miss_lstm, "./Output/LSTM/Miss")
 Combined_lstm_plots <- create_lstm_validation_plots(Combined_lstm, "./Output/LSTM/Combined")
 
 # Display summary plots
-if (!is.null(IWW_lstm_plots$summary)) print(IWW_lstm_plots$summary)
-if (!is.null(Miss_lstm_plots$summary)) print(Miss_lstm_plots$summary)
+if (!is.null(IWW_lstm_plots$summary)) {
+ cat("\nIllinois Waterway Summary:\n")
+ print(IWW_lstm_plots$summary)
+}
+
+if (!is.null(Miss_lstm_plots$summary)) {
+ cat("\nMississippi River Summary:\n")
+ print(Miss_lstm_plots$summary)
+}
 ```
 
-## Train Pool-Level LSTM Models
+## Build Pool-Level Training LSTM Models
 
 ```{r train-lstm-pool-models}
+#' Train LSTM with autoregressive features for a specific pool
+
+train_pool_lstm <- function(data,
+                           pool_name,
+                           river_code,
+                           pool_gage_mapping,
+                           threshold,
+                           sequence_length = 30,
+                           forecast_horizon = 40,
+                           min_samples = 150,
+                           epochs = 75,
+                           patience = 15) {
+ 
+ key <- paste(river_code, pool_name, sep = "_")
+ 
+ if (!key %in% names(pool_gage_mapping)) {
+   return(list(
+     pool = pool_name,
+     river = river_code,
+     status = "no_mapping",
+     metrics = NULL
+   ))
+ }
+ 
+ pool_map <- pool_gage_mapping[[key]]
+ river_filter <- pool_map$river_filter
+ selected_gages <- pool_map$selected_gages
+ 
+ # Filter data for this pool
+ pool_data <- data |>
+   filter(pool == pool_name, river == river_filter) |>
+   arrange(SurveyDateBefore)
+ 
+ # Check minimum samples (need more for AR features due to lagging)
+ min_required <- sequence_length + forecast_horizon + 50 + 30  # Extra for AR lags
+ 
+ if (nrow(pool_data) < max(min_samples, min_required)) {
+   return(list(
+     pool = pool_name,
+     river = river_code,
+     status = "insufficient_samples",
+     n = nrow(pool_data),
+     required = max(min_samples, min_required),
+     metrics = NULL
+   ))
+ }
+ 
+ cat(sprintf("\n--- LSTM Pool %s (%s): %d samples ---\n", 
+             pool_name, river_code, nrow(pool_data)))
+ 
+ # Prepare data with autoregressive features
+ lstm_data <- tryCatch({
+   prepare_lstm_data_autoregressive(
+     data = pool_data,
+     gages_to_use = selected_gages,
+     sequence_length = sequence_length,
+     forecast_horizon = forecast_horizon,
+     dataset_name = paste("Pool", pool_name),
+     shoaling_lags = c(1, 7, 14),  # Fewer lags for smaller datasets
+     include_rolling_stats = TRUE
+   )
+ }, error = function(e) {
+   cat(sprintf("  Data prep error: %s\n", e$message))
+   NULL
+ })
+ 
+ if (is.null(lstm_data)) {
+   return(list(
+     pool = pool_name,
+     river = river_code,
+     status = "data_prep_failed",
+     metrics = NULL
+   ))
+ }
+ 
+ # Train model
+ lstm_result <- tryCatch({
+   train_lstm_comprehensive(
+     lstm_data = lstm_data,
+     dataset_name = paste("Pool", pool_name),
+     threshold = threshold,
+     epochs = epochs,
+     batch_size = min(32, floor(lstm_data$n_train / 4)),
+     patience = patience,
+     lstm_units = c(64, 32),  # Smaller for pool-level
+     learning_rate = 0.001
+   )
+ }, error = function(e) {
+   cat(sprintf("  Training error: %s\n", e$message))
+   NULL
+ })
+ 
+ if (is.null(lstm_result)) {
+   return(list(
+     pool = pool_name,
+     river = river_code,
+     status = "training_failed",
+     metrics = NULL
+   ))
+ }
+ 
+ # Add pool info to results
+ lstm_result$pool <- pool_name
+ lstm_result$river <- river_code
+ lstm_result$status <- "success"
+ lstm_result$n_samples <- nrow(pool_data)
+ lstm_result$summary_metrics$Pool <- pool_name
+ lstm_result$summary_metrics$River <- river_code
+ lstm_result$summary_metrics$N_Samples <- nrow(pool_data)
+ 
+ return(lstm_result)
+}
+```
+
+
+## Train Pool Level LSTM Models
+```{r}
 # Filter pools with sufficient data for LSTM (>= 150 samples)
 lstm_viable_pools <- viable_pools |>
-  filter(n_samples >= 150)
+ filter(n_samples >= 150)
 
-cat(sprintf("Training LSTM for %d viable pools\n", nrow(lstm_viable_pools)))
+cat(sprintf("\nPools with sufficient data for LSTM: %d of %d\n", 
+           nrow(lstm_viable_pools), nrow(viable_pools)))
 
+if (nrow(lstm_viable_pools) > 0) {
+ print(lstm_viable_pools |> select(pool, river, n_samples))
+}
+
+# Train models for each viable pool
 pool_lstm_results <- list()
 
 for (i in 1:nrow(lstm_viable_pools)) {
-  pool_name <- lstm_viable_pools$pool[i]
-  river_code <- lstm_viable_pools$river[i]
-  
-  pool_threshold <- pool_thresholds |>
-    filter(pool == pool_name) |>
-    pull(mean_rate)
-  
-  if (length(pool_threshold) == 0) {
-    pool_threshold <- ifelse(river_code == "IL", IWW_thresh, Miss_thresh)
-  }
-  
-  result <- train_pool_lstm_fixed(
-    data = gage_CSAT_joined,
-    pool_name = pool_name,
-    river_code = river_code,
-    pool_gage_mapping = pool_gage_mapping,
-    threshold = pool_threshold,
-    sequence_length = 30,
-    forecast_horizon = 40,
-    min_samples = 150,
-    epochs = 75,
-    patience = 15
-  )
-  
-  key <- paste(river_code, pool_name, sep = "_")
-  pool_lstm_results[[key]] <- result
-  
-  # Generate plots for successful models
-  if (result$status == "success") {
-    create_lstm_validation_plots(result, output_dir = paste0("./Output/LSTM/Pool_", pool_name))
-  }
+ pool_name <- lstm_viable_pools$pool[i]
+ river_code <- lstm_viable_pools$river[i]
+ 
+ # Get threshold
+ pool_threshold <- pool_thresholds |>
+   filter(pool == pool_name) |>
+   pull(mean_rate)
+ 
+ if (length(pool_threshold) == 0) {
+   pool_threshold <- ifelse(river_code == "IL", IWW_thresh, Miss_thresh)
+ }
+ 
+ # Train
+ result <- train_pool_lstm(
+   data = gage_CSAT_joined,
+   pool_name = pool_name,
+   river_code = river_code,
+   pool_gage_mapping = pool_gage_mapping,
+   threshold = pool_threshold,
+   sequence_length = 30,
+   forecast_horizon = 40,
+   min_samples = 150,
+   epochs = 75,
+   patience = 15
+ )
+ 
+ key <- paste(river_code, pool_name, sep = "_")
+ pool_lstm_results[[key]] <- result
+ 
+ # Generate plots for successful models
+ if (!is.null(result$status) && result$status == "success") {
+   create_lstm_validation_plots(
+     result, 
+     output_dir = paste0("./Output/LSTM/Pool_", pool_name)
+   )
+ }
+ 
+ # Clean up between pools
+ keras3::clear_session()
+ gc()
 }
 
 # Compile pool-level metrics
 pool_lstm_metrics <- do.call(rbind, lapply(pool_lstm_results, function(x) {
-  if (!is.null(x$summary_metrics)) x$summary_metrics else NULL
+ if (!is.null(x$summary_metrics)) x$summary_metrics else NULL
 }))
 
-cat("\n=== POOL LSTM RESULTS ===\n")
+cat("\n")
+cat(strrep("=", 70), "\n")
+cat("POOL-LEVEL LSTM RESULTS\n")
+cat(strrep("=", 70), "\n")
+
 if (!is.null(pool_lstm_metrics) && nrow(pool_lstm_metrics) > 0) {
-  print(pool_lstm_metrics |> 
-          select(Pool, River, Test_RMSE_1Step, Accuracy_1Step, F1_1Step) |>
-          arrange(Test_RMSE_1Step))
-  
-  write_csv(pool_lstm_metrics, "./Output/LSTM/Pool_Level_Metrics.csv")
+ print(pool_lstm_metrics |>
+         select(Pool, River, N_Samples, Test_RMSE_1Step, 
+                Variance_Ratio, Accuracy_1Step, F1_1Step, Diagnostic_Status) |>
+         arrange(Test_RMSE_1Step))
+ 
+ write_csv(pool_lstm_metrics, "./Output/LSTM/Pool_Level_Metrics.csv")
+} else {
+ cat("No pool-level LSTM models trained successfully\n")
 }
 ```
+
 
 ## LSTM Results Summary
 
 ```{r lstm-results-summary}
 cat("\n")
-cat(strrep("=", 80), "\n")
-cat("                         LSTM RESULTS SUMMARY                              \n")
-cat(strrep("=", 80), "\n\n")
+cat(strrep("#", 80), "\n")
+cat("#                    LSTM RESULTS SUMMARY (AUTOREGRESSIVE)                    #\n")
+cat(strrep("#", 80), "\n")
 
-# Lookback comparison
-cat("=== LOOKBACK WINDOW OPTIMIZATION ===\n")
-print(lookback_comparison |> select(River, lookback, test_rmse, accuracy, f1) |> arrange(River, test_rmse))
+# ============================================================================
+# AR Configuration Comparison
+# ============================================================================
 
-# River-level results
+cat("\n=== AUTOREGRESSIVE CONFIGURATION COMPARISON ===\n")
+if (exists("ar_comparison") && !is.null(ar_comparison)) {
+ print(ar_comparison |> 
+         filter(Status == "HEALTHY" | !is.na(RMSE)) |>
+         select(River, Config, RMSE, Correlation, Variance_Ratio, Accuracy, Status) |>
+         arrange(River, desc(Variance_Ratio)))
+}
+
+# ============================================================================
+# River-Level Results
+# ============================================================================
+
 cat("\n=== RIVER-LEVEL LSTM PERFORMANCE ===\n")
+
 river_lstm_metrics <- bind_rows(
-  if (!is.null(IWW_lstm)) IWW_lstm$summary_metrics,
-  if (!is.null(Miss_lstm)) Miss_lstm$summary_metrics,
-  if (!is.null(Combined_lstm)) Combined_lstm$summary_metrics
+ if (!is.null(IWW_lstm)) IWW_lstm$summary_metrics else NULL,
+ if (!is.null(Miss_lstm)) Miss_lstm$summary_metrics else NULL,
+ if (!is.null(Combined_lstm)) Combined_lstm$summary_metrics else NULL
 )
 
-if (!is.null(river_lstm_metrics)) {
-  print(river_lstm_metrics |> 
-          select(Dataset, Sequence_Length, Test_RMSE_1Step, Accuracy_1Step, F1_1Step))
-  
-  write_csv(river_lstm_metrics, "./Output/LSTM/River_Level_Metrics.csv")
+if (!is.null(river_lstm_metrics) && nrow(river_lstm_metrics) > 0) {
+ 
+ cat("\nRegression Metrics:\n")
+ print(river_lstm_metrics |>
+         select(Dataset, Test_RMSE_1Step, Test_MAE_1Step, 
+                Test_Correlation_1Step, Variance_Ratio) |>
+         mutate(across(where(is.numeric), ~round(., 3))))
+ 
+ cat("\nClassification Metrics:\n")
+ print(river_lstm_metrics |>
+         select(Dataset, Accuracy_1Step, Precision_1Step, 
+                Recall_1Step, F1_1Step) |>
+         mutate(across(where(is.numeric), ~round(., 3))))
+ 
+ cat("\nDiagnostic Status:\n")
+ print(river_lstm_metrics |>
+         select(Dataset, Variance_Ratio, Diagnostic_Status))
+ 
+ write_csv(river_lstm_metrics, "./Output/LSTM/River_Level_Metrics.csv")
 }
 
-# Pool-level summary
-cat("\n=== POOL-LEVEL LSTM PERFORMANCE ===\n")
+# ============================================================================
+# Pool-Level Summary
+# ============================================================================
+
+cat("\n=== POOL-LEVEL LSTM SUMMARY ===\n")
+
 if (!is.null(pool_lstm_metrics) && nrow(pool_lstm_metrics) > 0) {
-  pool_summary <- pool_lstm_metrics |>
-    group_by(River) |>
-    summarise(
-      N_Pools = n(),
-      Avg_RMSE = round(mean(Test_RMSE_1Step, na.rm = TRUE), 3),
-      Avg_Accuracy = round(mean(Accuracy_1Step, na.rm = TRUE) * 100, 1),
-      Avg_F1 = round(mean(F1_1Step, na.rm = TRUE), 3),
-      .groups = "drop"
-    )
-  print(pool_summary)
+ 
+ pool_summary <- pool_lstm_metrics |>
+   group_by(River) |>
+   summarise(
+     N_Pools = n(),
+     N_Healthy = sum(Diagnostic_Status == "HEALTHY"),
+     Avg_RMSE = round(mean(Test_RMSE_1Step, na.rm = TRUE), 3),
+     Avg_Correlation = round(mean(Test_Correlation_1Step, na.rm = TRUE), 3),
+     Avg_Variance_Ratio = round(mean(Variance_Ratio, na.rm = TRUE), 3),
+     Avg_Accuracy = round(mean(Accuracy_1Step, na.rm = TRUE) * 100, 1),
+     .groups = "drop"
+   )
+ 
+ print(pool_summary)
 }
 
-# Comparison with xGBoost
+# ============================================================================
+# LSTM vs xGBoost Comparison
+# ============================================================================
+
 cat("\n=== LSTM vs xGBoost COMPARISON ===\n")
+
 comparison_df <- data.frame(
-  River = c("Illinois Waterway", "Mississippi River"),
-  xGBoost_RMSE = c(IWW_xgb$metrics$Test_RMSE, Miss_xgb$metrics$Test_RMSE),
-  LSTM_RMSE = c(
-    ifelse(!is.null(IWW_lstm), IWW_lstm$summary_metrics$Test_RMSE_1Step, NA),
-    ifelse(!is.null(Miss_lstm), Miss_lstm$summary_metrics$Test_RMSE_1Step, NA)
-  ),
-  xGBoost_Accuracy = c(IWW_xgb$metrics$Accuracy, Miss_xgb$metrics$Accuracy),
-  LSTM_Accuracy = c(
-    ifelse(!is.null(IWW_lstm), IWW_lstm$summary_metrics$Accuracy_1Step, NA),
-    ifelse(!is.null(Miss_lstm), Miss_lstm$summary_metrics$Accuracy_1Step, NA)
-  )
+ River = c("Illinois Waterway", "Mississippi River", "Combined"),
+ xGBoost_RMSE = c(
+   IWW_xgb$metrics$Test_RMSE,
+   Miss_xgb$metrics$Test_RMSE,
+   Combined_xgb$metrics$Test_RMSE
+ ),
+ LSTM_RMSE = c(
+   ifelse(!is.null(IWW_lstm), IWW_lstm$summary_metrics$Test_RMSE_1Step, NA),
+   ifelse(!is.null(Miss_lstm), Miss_lstm$summary_metrics$Test_RMSE_1Step, NA),
+   ifelse(!is.null(Combined_lstm), Combined_lstm$summary_metrics$Test_RMSE_1Step, NA)
+ ),
+ xGBoost_Accuracy = c(
+   IWW_xgb$metrics$Accuracy * 100,
+   Miss_xgb$metrics$Accuracy * 100,
+   Combined_xgb$metrics$Accuracy * 100
+ ),
+ LSTM_Accuracy = c(
+   ifelse(!is.null(IWW_lstm), IWW_lstm$summary_metrics$Accuracy_1Step * 100, NA),
+   ifelse(!is.null(Miss_lstm), Miss_lstm$summary_metrics$Accuracy_1Step * 100, NA),
+   ifelse(!is.null(Combined_lstm), Combined_lstm$summary_metrics$Accuracy_1Step * 100, NA)
+ ),
+ LSTM_Variance_Ratio = c(
+   ifelse(!is.null(IWW_lstm), IWW_lstm$summary_metrics$Variance_Ratio, NA),
+   ifelse(!is.null(Miss_lstm), Miss_lstm$summary_metrics$Variance_Ratio, NA),
+   ifelse(!is.null(Combined_lstm), Combined_lstm$summary_metrics$Variance_Ratio, NA)
+ ),
+ LSTM_Status = c(
+   ifelse(!is.null(IWW_lstm), IWW_lstm$summary_metrics$Diagnostic_Status, NA),
+   ifelse(!is.null(Miss_lstm), Miss_lstm$summary_metrics$Diagnostic_Status, NA),
+   ifelse(!is.null(Combined_lstm), Combined_lstm$summary_metrics$Diagnostic_Status, NA)
+ )
 ) |>
-  mutate(
-    RMSE_Winner = ifelse(xGBoost_RMSE < LSTM_RMSE, "xGBoost", "LSTM"),
-    Accuracy_Winner = ifelse(xGBoost_Accuracy > LSTM_Accuracy, "xGBoost", "LSTM")
-  )
+ mutate(
+   RMSE_Winner = case_when(
+     is.na(LSTM_RMSE) ~ "xGBoost",
+     xGBoost_RMSE < LSTM_RMSE ~ "xGBoost",
+     TRUE ~ "LSTM"
+   ),
+   Accuracy_Winner = case_when(
+     is.na(LSTM_Accuracy) ~ "xGBoost",
+     xGBoost_Accuracy > LSTM_Accuracy ~ "xGBoost",
+     TRUE ~ "LSTM"
+   )
+ )
 
-print(comparison_df)
+print(comparison_df |>
+       select(River, xGBoost_RMSE, LSTM_RMSE, RMSE_Winner,
+              xGBoost_Accuracy, LSTM_Accuracy, Accuracy_Winner, LSTM_Status) |>
+       mutate(across(where(is.numeric), ~round(., 3))))
 
-cat("\n=== KEY FINDINGS ===\n")
+write_csv(comparison_df, "./Output/Comparisons/LSTM_vs_xGBoost.csv")
+
+# ============================================================================
+# Key Findings
+# ============================================================================
+
+cat("\n")
+cat(strrep("=", 70), "\n")
+cat("KEY FINDINGS - AUTOREGRESSIVE LSTM\n")
+cat(strrep("=", 70), "\n")
+
 for (i in 1:nrow(comparison_df)) {
-  cat(sprintf("\n%s:\n", comparison_df$River[i]))
-  cat(sprintf("  Best regression model: %s (RMSE: %.4f)\n", 
-              comparison_df$RMSE_Winner[i],
-              min(comparison_df$xGBoost_RMSE[i], comparison_df$LSTM_RMSE[i], na.rm = TRUE)))
-  cat(sprintf("  Best classification model: %s (Accuracy: %.1f%%)\n",
-              comparison_df$Accuracy_Winner[i],
-              max(comparison_df$xGBoost_Accuracy[i], comparison_df$LSTM_Accuracy[i], na.rm = TRUE) * 100))
+ cat(sprintf("\n%s:\n", comparison_df$River[i]))
+ cat(sprintf("  xGBoost RMSE: %.3f | LSTM RMSE: %.3f → Winner: %s\n",
+             comparison_df$xGBoost_RMSE[i],
+             ifelse(is.na(comparison_df$LSTM_RMSE[i]), NA, comparison_df$LSTM_RMSE[i]),
+             comparison_df$RMSE_Winner[i]))
+ cat(sprintf("  xGBoost Acc: %.1f%% | LSTM Acc: %.1f%% → Winner: %s\n",
+             comparison_df$xGBoost_Accuracy[i],
+             ifelse(is.na(comparison_df$LSTM_Accuracy[i]), NA, comparison_df$LSTM_Accuracy[i]),
+             comparison_df$Accuracy_Winner[i]))
+ cat(sprintf("  LSTM Variance Ratio: %.3f | Status: %s\n",
+             ifelse(is.na(comparison_df$LSTM_Variance_Ratio[i]), NA, 
+                    comparison_df$LSTM_Variance_Ratio[i]),
+             ifelse(is.na(comparison_df$LSTM_Status[i]), "N/A", comparison_df$LSTM_Status[i])))
 }
-```
 
-## LSTM Horizon Analysis Plot
+# ============================================================================
+# Improvement Assessment
+# ============================================================================
 
-```{r lstm-horizon-analysis, fig.height=8, fig.width=12}
+cat("\n")
+cat(strrep("=", 70), "\n")
+cat("AUTOREGRESSIVE APPROACH ASSESSMENT\n")
+cat(strrep("=", 70), "\n")
+
+# Check if AR approach fixed the regression-to-mean issue
+healthy_count <- sum(comparison_df$LSTM_Status == "HEALTHY", na.rm = TRUE)
+total_count <- sum(!is.na(comparison_df$LSTM_Status))
+
+cat(sprintf("\nHealthy models (variance ratio >= 0.5, correlation >= 0.3): %d of %d\n",
+           healthy_count, total_count))
+
+if (healthy_count == total_count && total_count > 0) {
+ cat("\n✓ SUCCESS: Autoregressive approach has resolved regression-to-mean behavior\n")
+ cat("  All models now show meaningful predictive variance.\n")
+} else if (healthy_count > 0) {
+ cat("\n⚠ PARTIAL SUCCESS: Some models improved, others still problematic\n")
+ cat("  Consider additional tuning for problematic models.\n")
+} else {
+ cat("\n✗ ISSUE: Models still showing regression-to-mean behavior\n")
+ cat("  Consider: simpler architecture, 1-step prediction, more AR features\n")
+}
+
+cat("\n")
+cat(strrep("#", 80), "\n")
+LSTM Horizon Analysis Plot
 # Combine horizon metrics from all river-level models
 horizon_data <- bind_rows(
-  if (!is.null(IWW_lstm)) IWW_lstm$horizon_metrics |> mutate(Dataset = "Illinois Waterway"),
-  if (!is.null(Miss_lstm)) Miss_lstm$horizon_metrics |> mutate(Dataset = "Mississippi River"),
-  if (!is.null(Combined_lstm)) Combined_lstm$horizon_metrics |> mutate(Dataset = "Combined")
+ if (!is.null(IWW_lstm)) {
+   IWW_lstm$horizon_metrics |> mutate(Dataset = "Illinois Waterway")
+ },
+ if (!is.null(Miss_lstm)) {
+   Miss_lstm$horizon_metrics |> mutate(Dataset = "Mississippi River")
+ },
+ if (!is.null(Combined_lstm)) {
+   Combined_lstm$horizon_metrics |> mutate(Dataset = "Combined")
+ }
 )
 
 if (nrow(horizon_data) > 0) {
-  p_horizon <- ggplot(horizon_data, aes(x = horizon_day, y = test_rmse, color = Dataset)) +
-    geom_line(linewidth = 1.2) +
-    geom_point(size = 2) +
-    geom_vline(xintercept = c(7, 14, 21, 30, 40), linetype = "dashed", alpha = 0.3) +
-    scale_color_viridis_d() +
-    labs(
-      title = "LSTM Forecast Error by Horizon",
-      subtitle = "Error increases with forecast distance (vertical lines mark key horizons)",
-      x = "Forecast Horizon (days ahead)",
-      y = "RMSE (ft/yr)"
-    ) +
-    theme_minimal() +
-    theme(legend.position = "bottom")
-  
-  print(p_horizon)
-  ggsave("./Output/LSTM/Horizon_Performance_All.png", width = 12, height = 8)
+ 
+ # RMSE by horizon
+ p_horizon_rmse <- ggplot(horizon_data, aes(x = horizon_day, y = test_rmse, color = Dataset)) +
+   geom_line(linewidth = 1.2) +
+   geom_point(size = 2) +
+   geom_vline(xintercept = c(7, 14, 21, 30, 40), linetype = "dashed", alpha = 0.3) +
+   scale_color_viridis_d() +
+   labs(
+     title = "LSTM Forecast Error by Horizon (Autoregressive)",
+     subtitle = "Vertical lines mark key decision horizons",
+     x = "Forecast Horizon (days ahead)",
+     y = "RMSE (ft/yr)"
+   ) +
+   theme_minimal() +
+   theme(legend.position = "bottom")
+ 
+ # Correlation by horizon
+ p_horizon_cor <- ggplot(horizon_data, aes(x = horizon_day, y = test_correlation, color = Dataset)) +
+   geom_line(linewidth = 1.2) +
+   geom_point(size = 2) +
+   geom_hline(yintercept = c(0.3, 0.5), linetype = "dashed", 
+              color = c("orange", "green"), alpha = 0.7) +
+   scale_color_viridis_d() +
+   labs(
+     title = "LSTM Correlation by Horizon",
+     subtitle = "Green = Good (0.5), Orange = Minimum (0.3)",
+     x = "Forecast Horizon (days ahead)",
+     y = "Correlation"
+   ) +
+   theme_minimal() +
+   theme(legend.position = "bottom")
+ 
+ horizon_combined <- p_horizon_rmse + p_horizon_cor
+ print(horizon_combined)
+ 
+ ggsave("./Output/LSTM/Horizon_Performance_All_AR.png", 
+        horizon_combined, width = 14, height = 6)
 }
 ```
+
 
 
 # Compile Model Results 
