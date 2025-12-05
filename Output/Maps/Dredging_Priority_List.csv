@@ -1,5 +1,8 @@
 Pool,river_label,Predicted_Rate,Threshold,Urgency,Last_Survey,Days_Since_Survey
-14,Mississippi River,6.52,0.7,HIGH,2024-10-30,397
-17,Mississippi River,3.18,0.7,HIGH,2024-07-24,495
-13,Mississippi River,1.97,0.7,HIGH,2024-08-07,481
-22,Mississippi River,0.82,0.7,MODERATE,2024-11-12,384
+14,Mississippi River,8.11,0.7,HIGH,2024-10-30,401
+12,Mississippi River,2.07,0.7,HIGH,2024-09-10,451
+17,Mississippi River,1.74,0.7,HIGH,2024-07-24,499
+13,Mississippi River,1.46,0.7,HIGH,2024-08-07,485
+16,Mississippi River,0.78,0.7,MODERATE,2024-08-29,463
+PE,Illinois Waterway,0.72,0.48,MODERATE,2024-07-23,500
+MA,Illinois Waterway,0.7,0.48,MODERATE,2023-11-15,751

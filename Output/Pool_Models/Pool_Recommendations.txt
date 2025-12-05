@@ -1,0 +1,78 @@
+
+╔════════════════════════════════════════════════════════════════════════╗
+║              POOL-LEVEL MODEL RECOMMENDATIONS                          ║
+╚════════════════════════════════════════════════════════════════════════╝
+
+Overall Pool-Level Performance:
+  • Pools Modeled: 16
+  • Average RMSE: 2.0634 ft/yr
+  • Average F1 Score: 0.443
+  • Model Selection: 5 xGBoost, 11 LSTM
+
+=== Illinois Waterway ===
+  Pools: 5
+  Best Performing Pool: PE (RMSE: 0.9953, F1: 0.167, Model: LSTM)
+  Model Selection: 3 xGBoost, 2 LSTM
+  → Recommendation: xGBoost performs better overall
+     • Use for operational dredging decisions
+     • Faster predictions, easier to interpret
+
+  Top 3 Performing Pools:
+    1. Pool PE: RMSE=0.9953, F1=0.167 (LSTM)
+    2. Pool DR: RMSE=1.4508, F1=0.966 (xGBoost)
+    3. Pool SR: RMSE=1.7010, F1=0.635 (LSTM)
+
+  Pools Needing Improvement:
+    1. Pool LA: RMSE=2.2653, F1=0.227 (xGBoost)
+    2. Pool MA: RMSE=2.0302, F1=0.400 (xGBoost)
+    3. Pool SR: RMSE=1.7010, F1=0.635 (LSTM)
+
+=== Mississippi River ===
+  Pools: 11
+  Best Performing Pool: 17 (RMSE: 1.4344, F1: 0.424, Model: LSTM)
+  Model Selection: 2 xGBoost, 9 LSTM
+  → Recommendation: LSTM captures temporal patterns better
+     • Use for long-term planning
+     • Better for pools with strong seasonal patterns
+
+  Top 3 Performing Pools:
+    1. Pool 17: RMSE=1.4344, F1=0.424 (LSTM)
+    2. Pool 19: RMSE=1.4618, F1=0.603 (LSTM)
+    3. Pool 15: RMSE=1.8975, F1=0.167 (xGBoost)
+
+  Pools Needing Improvement:
+    1. Pool 12: RMSE=3.1504, F1=0.444 (LSTM)
+    2. Pool 20: RMSE=2.9593, F1=0.429 (xGBoost)
+    3. Pool 14: RMSE=2.8991, F1=0.557 (LSTM)
+
+=== Head-to-Head Model Comparison ===
+Pools with both models: 14
+
+  xGBoost wins: 3 (21.4%)
+  LSTM wins: 11 (78.6%)
+  Average improvement: 25.7%
+
+  Largest Performance Differences:
+    1. Pool 19: LSTM better by 52.8%
+    2. Pool 12: LSTM better by 49.7%
+    3. Pool MA: xGBoost better by 44.6%
+
+=== Deployment Recommendations ===
+
+Immediate Actions:
+  • Deploy best model for each pool
+  • Set up automated weekly predictions
+  • Monitor high-RMSE pools more frequently
+
+Model Selection Guidelines:
+  • xGBoost: Use when interpretability and speed are priorities
+  • LSTM: Use when temporal patterns are strong
+  • Consider ensemble methods for critical pools
+
+Data Collection Priorities:
+  • Increase survey frequency in 8 pools with limited data
+  • Priority pools for additional data collection:
+    - Pool 15: 90 samples (RMSE: 1.8975)
+    - Pool DR: 96 samples (RMSE: 1.4508)
+    - Pool MA: 236 samples (RMSE: 2.0302)
+
